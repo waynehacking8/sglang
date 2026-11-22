@@ -977,6 +977,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             group_size=group_size,
             use_per_token_activation=False,
         )
+        nvfp4a16_config.is_w4a16 = True
 
         return cls(
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -2446,8 +2447,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     def enable_flashinfer_cutlass_moe(self) -> bool:
         from sglang.srt.layers.moe import get_moe_runner_backend
 
-        """Access the global enable_flashinfer_cutlass_moe setting."""
-        return get_moe_runner_backend().is_flashinfer_cutlass()
+        """Whether this layer runs flashinfer_cutlass: the backend create_moe_runner
+        resolved, or the global setting before it runs."""
+        return getattr(
+            self, "_moe_runner_backend", get_moe_runner_backend()
+        ).is_flashinfer_cutlass()
 
     @property
     def enable_flashinfer_cutedsl_moe(self) -> bool:
@@ -3173,6 +3177,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
                 moe_runner_backend = MoeRunnerBackend.MARLIN
+            elif get_platform().is_sm120 or get_platform().is_sm110:
+                # trtllm-gen MoE kernels are SM100-only. W4A16 layers keep the
+                # 16-bit activations their checkpoint declares, and
+                # flashinfer_cutlass takes only pure TP or pure EP placements.
+                use_cutlass = not self.quant_config.is_w4a16 and (
+                    layer.moe_ep_size == 1 or layer.moe_tp_size == 1
+                )
+                moe_runner_backend = (
+                    MoeRunnerBackend.FLASHINFER_CUTLASS
+                    if use_cutlass
+                    else MoeRunnerBackend.MARLIN
+                )
             else:
                 # TRTLLM is currently the most performant and tested FP4 MoE
                 # backend, so use it as the default.

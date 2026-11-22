@@ -55,8 +55,6 @@ from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_
 logger = logging.getLogger(__name__)
 from sglang.srt.configs.quant_utils import (
     LOADER_RESOLVED_QUANT_METHODS,
-    get_mixed_precision_moe_quant_algos,
-    get_modelopt_quant_section,
     get_quantization_config,
 )
 from sglang.srt.environ import envs
@@ -1762,67 +1760,6 @@ def _dp_lm_head_validation(view: Any) -> dict:
     return {}
 
 
-# Llama 4 applies router weights to the expert input (models/llama4.py).
-_ROUTER_WEIGHT_ON_INPUT_ARCHS = frozenset(
-    {"Llama4ForConditionalGeneration", "Llama4ForCausalLM"}
-)
-
-
-def _sm1xx_modelopt_nvfp4_moe_backend(view: Any) -> str:
-    """MoE runner for a ModelOpt NVFP4 MoE checkpoint on SM110/SM120, where auto
-    resolves to trtllm-gen, whose MoE kernels are SM100-only. Returns "auto" when
-    the rule does not apply."""
-    model_config = model_config_of(view)
-    # The weight loader follows ModelConfig, which reads the checkpoint and can
-    # refine an explicit --quantization (modelopt_fp4 on a mixed checkpoint).
-    quantization = model_config.quantization
-    if quantization not in ("modelopt_fp4", "modelopt_mixed"):
-        return "auto"
-    from sglang.srt.model_loader.utils import _is_moe_model
-
-    architectures = model_config.hf_config.architectures or []
-    if not _is_moe_model(model_config, architectures):
-        # Only MoE layers use the MoE runner backend.
-        return "auto"
-    if _ROUTER_WEIGHT_ON_INPUT_ARCHS.intersection(architectures) or getattr(
-        model_config.hf_text_config, "moe_apply_router_weight_on_input", False
-    ):
-        raise ValueError(
-            "ModelOpt NVFP4 MoE with router weights applied to the expert input "
-            f"({architectures[0] if architectures else 'this model'}) has no MoE "
-            "runner on SM110/SM120: the NVFP4 MoE method rejects them under "
-            "flashinfer_cutlass and flashinfer_cutedsl, marlin applies them to "
-            "the output, and trtllm-gen is SM100-only."
-        )
-    if quantization == "modelopt_mixed":
-        # Read the per-layer map from where the weight loader reads it.
-        expert_algos = get_mixed_precision_moe_quant_algos(
-            model_config.hf_config, model_config.model_path, model_config.revision
-        )
-        if not expert_algos:
-            logger.warning(
-                "No MoE expert formats found in the modelopt_mixed config; "
-                "leaving --moe-runner-backend auto."
-            )
-    else:
-        section = get_modelopt_quant_section(
-            model_config.hf_config, model_config.model_path, model_config.revision
-        )
-        expert_algos = {str(section.get("quant_algo", "")).upper()}
-    if "W4A16_NVFP4" in expert_algos:
-        # Keeps the 16-bit activations the checkpoint declares.
-        backend = "marlin"
-    elif quantization == "modelopt_fp4" or "NVFP4" in expert_algos:
-        backend = "flashinfer_cutlass"
-    else:
-        return "auto"
-    logger.info(
-        f"Use {backend} as MoE runner backend on SM110/SM120 for {quantization} "
-        "(trtllm-gen MoE kernels are SM100-only)"
-    )
-    return backend
-
-
 @register_post_process
 def _moe_runner_backend_quant_constraints(view: Any) -> dict:
     """Resolve MoE runner backends from quantization."""
@@ -1888,10 +1825,16 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 moe_runner_backend,
             )
             moe_runner_backend = mxfp8_default
-    if moe_runner_backend == "auto" and (
-        get_platform().is_sm120 or get_platform().is_sm110
+    if (
+        moe_runner_backend == "auto"
+        and view.quantization == "modelopt_fp4"
+        and (get_platform().is_sm120 or get_platform().is_sm110)
     ):
-        moe_runner_backend = _sm1xx_modelopt_nvfp4_moe_backend(view)
+        moe_runner_backend = "flashinfer_cutlass"
+        logger.info(
+            "Use flashinfer_cutlass as MoE runner backend on SM110/SM120 for "
+            "modelopt_fp4 (trtllm-gen MoE kernels are SM100-only)"
+        )
     if moe_runner_backend != view.moe_runner_backend:
         return {"moe_runner_backend": moe_runner_backend}
     return {}

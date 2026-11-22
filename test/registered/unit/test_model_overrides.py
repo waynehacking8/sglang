@@ -842,9 +842,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(split_overrides["prefill_attention_backend"], "fa3")
                 self.assertEqual(split_overrides["decode_attention_backend"], "fa3")
 
-    def _construct(
-        self, arch, model_type, config_extra=None, extra_files=None, **server_kwargs
-    ):
+    def _construct(self, arch, model_type, config_extra=None, **server_kwargs):
         from sglang.srt.server_args import ServerArgs
 
         # Golden resolution must be host-independent: accelerator-less CI
@@ -856,9 +854,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.addCleanup(shutil.rmtree, config_dir, ignore_errors=True)
         with open(os.path.join(config_dir, "config.json"), "w") as f:
             json.dump(config, f)
-        for name, content in (extra_files or {}).items():
-            with open(os.path.join(config_dir, name), "w") as f:
-                json.dump(content, f)
         server_args = ServerArgs(model_path=config_dir, **server_kwargs)
         server_args.resolve_once()
         return server_args
@@ -1178,11 +1173,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             nvfp4._resolved_overrides,
         )
 
-        # Other architectures keep the existing auto behavior; SM110 and SM120
-        # are covered by test_sm1xx_modelopt_nvfp4_moe_auto_avoids_trtllm_gen.
+        # Thor (SM110) and other architectures keep the existing auto behavior.
         with (
             override_platform(is_sm100=False),
-            override_platform(is_sm110=False, is_sm120=False),
+            override_platform(is_sm120=False),
         ):
             non_sm10x = self._construct(
                 "MiniMaxM2ForCausalLM", "llama", quantization="modelopt_fp4"
@@ -1191,177 +1185,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         self._publish(nvfp4)
         self.assertEqual(get_exec().moe.moe_runner_backend, "flashinfer_trtllm_routed")
-
-    def test_sm1xx_modelopt_nvfp4_moe_auto_avoids_trtllm_gen(self):
-        """On SM110/SM120, auto must not leave an auto-detected ModelOpt NVFP4
-        MoE checkpoint to trtllm-gen, whose MoE kernels are SM100-only."""
-        mixed_w4a16 = {
-            "quant_method": "modelopt",
-            "quant_algo": "MIXED_PRECISION",
-            "quantized_layers": {
-                "model.layers.0.mlp.experts": {
-                    "quant_algo": "W4A16_NVFP4",
-                    "group_size": 16,
-                },
-                "model.layers.0.self_attn.qkv_proj": {"quant_algo": "FP8"},
-            },
-        }
-        mixed_nvfp4 = {
-            "quant_method": "modelopt",
-            "quant_algo": "MIXED_PRECISION",
-            "quantized_layers": {
-                "model.layers.0.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16},
-                "model.layers.0.self_attn.qkv_proj": {"quant_algo": "FP8"},
-            },
-        }
-        nvfp4 = {"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16}
-        for platform in (
-            {"is_sm120": True, "is_sm110": False},
-            {"is_sm120": False, "is_sm110": True},
-        ):
-            with self.subTest(**platform):
-                with override_platform(is_sm100=False, **platform):
-                    mixed = self._construct(
-                        "Qwen3MoeForCausalLM",
-                        "llama",
-                        config_extra={"quantization_config": mixed_w4a16},
-                    )
-                    mixed_fp4 = self._construct(
-                        "Qwen3MoeForCausalLM",
-                        "llama",
-                        config_extra={"quantization_config": mixed_nvfp4},
-                    )
-                    plain = self._construct(
-                        "Qwen3MoeForCausalLM",
-                        "llama",
-                        config_extra={"quantization_config": nvfp4},
-                    )
-                self.assertEqual(self._resolved(mixed, "moe_runner_backend"), "marlin")
-                self.assertEqual(
-                    self._resolved(mixed_fp4, "moe_runner_backend"),
-                    "flashinfer_cutlass",
-                )
-                self.assertEqual(
-                    self._resolved(plain, "moe_runner_backend"), "flashinfer_cutlass"
-                )
-
-    def test_sm1xx_modelopt_nvfp4_moe_auto_reads_loader_metadata(self):
-        """The SM110/SM120 choice follows the format the loader resolves: the
-        per-layer map from hf_quant_config.json when config.json has none, an
-        explicit modelopt_fp4 that ModelConfig refines to modelopt_mixed, and
-        W4A16_NVFP4 experts kept on 16-bit activations."""
-        from sglang.srt.arg_groups.model_override_base import model_config_of
-
-        experts_w4a16 = {
-            "model.layers.0.mlp.experts": {
-                "quant_algo": "W4A16_NVFP4",
-                "group_size": 16,
-            }
-        }
-        file_only_mixed = {
-            "producer": {"name": "modelopt"},
-            "quantization": {
-                "quant_algo": "MIXED_PRECISION",
-                "quantized_layers": experts_w4a16,
-            },
-        }
-        w4a16 = {
-            "quant_method": "modelopt",
-            "quant_algo": "W4A16_NVFP4",
-            "group_size": 16,
-        }
-        mixed_w4a16 = {
-            "quant_method": "modelopt",
-            "quant_algo": "MIXED_PRECISION",
-            "quantized_layers": experts_w4a16,
-        }
-        mixed_both = dict(
-            mixed_w4a16,
-            quantized_layers={
-                **experts_w4a16,
-                "model.layers.1.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16},
-            },
-        )
-        for platform in (
-            {"is_sm120": True, "is_sm110": False},
-            {"is_sm120": False, "is_sm110": True},
-        ):
-            with self.subTest(**platform):
-                with override_platform(is_sm100=False, **platform):
-                    file_only = self._construct(
-                        "Qwen3MoeForCausalLM",
-                        "llama",
-                        extra_files={"hf_quant_config.json": file_only_mixed},
-                    )
-                    top_level_w4a16 = self._construct(
-                        "Qwen3MoeForCausalLM",
-                        "llama",
-                        config_extra={"quantization_config": w4a16},
-                    )
-                    # marlin runs both formats and keeps the W4A16 layers'
-                    # 16-bit activations.
-                    both = self._construct(
-                        "Qwen3MoeForCausalLM",
-                        "llama",
-                        config_extra={"quantization_config": mixed_both},
-                    )
-                    explicit_fp4 = self._construct(
-                        "Qwen3MoeForCausalLM",
-                        "llama",
-                        config_extra={"quantization_config": mixed_w4a16},
-                        quantization="modelopt_fp4",
-                    )
-                # ModelConfig reads modelopt_mixed from the file alone.
-                self.assertEqual(
-                    model_config_of(file_only).quantization, "modelopt_mixed"
-                )
-                self.assertEqual(
-                    self._resolved(file_only, "moe_runner_backend"), "marlin"
-                )
-                for server_args in (top_level_w4a16, both, explicit_fp4):
-                    self.assertEqual(
-                        self._resolved(server_args, "moe_runner_backend"), "marlin"
-                    )
-
-    def test_sm1xx_modelopt_nvfp4_moe_auto_unsupported_cases(self):
-        """Dense models keep auto; an MoE model at an expert parallel size
-        flashinfer_cutlass rejects stops at its startup check; router weights on
-        the expert input (Llama 4) have no SM110/SM120 runner and fail at
-        startup."""
-        nvfp4 = {"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16}
-        for platform in (
-            {"is_sm120": True, "is_sm110": False},
-            {"is_sm120": False, "is_sm110": True},
-        ):
-            with self.subTest(**platform):
-                with override_platform(is_sm100=False, **platform):
-                    dense = self._construct(
-                        "LlamaForCausalLM",
-                        "llama",
-                        config_extra={"quantization_config": nvfp4},
-                        tp_size=4,
-                        ep_size=2,
-                    )
-                    with self.assertRaisesRegex(
-                        AssertionError, "expert parallel size must be 1"
-                    ):
-                        self._construct(
-                            "Qwen3MoeForCausalLM",
-                            "llama",
-                            config_extra={"quantization_config": nvfp4},
-                            tp_size=4,
-                            ep_size=2,
-                        )
-                    with self.assertRaisesRegex(ValueError, "router weights"):
-                        self._construct(
-                            "Llama4ForCausalLM",
-                            "llama",
-                            config_extra={
-                                "quantization_config": nvfp4,
-                                "num_local_experts": 4,
-                            },
-                        )
-                self.assertEqual(self._resolved(dense, "moe_runner_backend"), "auto")
 
     # ---- Command-A-Plus (Cohere2Moe) MoE runner gate ----
 
@@ -4008,22 +3831,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 quantization=None,
                 moe_runner_backend="auto",
                 moe_a2a_backend="none",
-                tp_size=1,
-                ep_size=1,
-                _quantization_explicitly_unset=False,
-                # A fixture-supplied `_model_config` is what `model_config_of`
-                # hands back: an MoE checkpoint resolving to the view's
-                # quantization.
-                _model_config=SimpleNamespace(
-                    quantization=None,
-                    hf_config=SimpleNamespace(architectures=["Qwen3MoeForCausalLM"]),
-                    hf_text_config=SimpleNamespace(),
-                    model_path="",
-                    revision=None,
-                ),
             )
             defaults.update(kw)
-            defaults["_model_config"].quantization = defaults["quantization"]
             return ResolvedView(SimpleNamespace(**defaults))
 
         with override_platform(is_sm100=True):
@@ -4066,8 +3875,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ),
                 {"moe_runner_backend": "flashinfer_cutlass"},
             )
-        with override_platform(is_sm110=False, is_sm120=False):
-            self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
+        self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
     def test_gguf_quantization_pass(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView

@@ -76,14 +76,6 @@ def _fp8_method(**overrides):
     return method
 
 
-def test_fp8_moe_layer_under_global_marlin(_moe_flags):
-    # A W4A16 NVFP4 checkpoint pins marlin globally; its fp8 MoE layers have no
-    # marlin path and run on triton.
-    _moe_flags.runner_backend = MoeRunnerBackend.MARLIN
-    method = _fp8_method(is_fp4_expert=False)
-    assert method._resolve_moe_runner_backend() == MoeRunnerBackend.TRITON
-
-
 @pytest.mark.parametrize("use_mxfp8,block_size", [(False, [128, 128]), (True, [1, 32])])
 def test_deepep_v2_quant_contract_accepts_blockwise_fp8(
     _moe_flags, use_mxfp8, block_size

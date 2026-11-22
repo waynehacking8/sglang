@@ -389,6 +389,79 @@ class TestNvFp4MoeDispatch(CustomTestCase):
         self.assertIn("g1_scale_c", str(ctx.exception))
         self.assertEqual(method.runner.calls, [])
 
+    def test_auto_avoids_trtllm_gen_on_sm110_and_sm120(self):
+        """trtllm-gen MoE kernels are SM100-only: auto runs W4A4 NVFP4 layers on
+        flashinfer_cutlass (pure TP or pure EP) and the rest on marlin, and the
+        cutlass weight prep follows the layer's backend while the global one
+        stays auto."""
+        cutlass, marlin = MoeRunnerBackend.FLASHINFER_CUTLASS, MoeRunnerBackend.MARLIN
+        cases = (
+            # arch, is_w4a16, (moe_tp_size, moe_ep_size), expected
+            ("sm120", False, (1, 1), cutlass),
+            ("sm120", False, (1, 4), cutlass),
+            ("sm120", False, (2, 2), marlin),
+            ("sm120", True, (1, 1), marlin),
+            ("sm110", False, (4, 1), cutlass),
+            ("sm110", True, (1, 1), marlin),
+            ("sm100", False, (1, 1), MoeRunnerBackend.FLASHINFER_TRTLLM),
+        )
+        for arch, is_w4a16, (moe_tp, moe_ep), expected in cases:
+            with self.subTest(arch=arch, is_w4a16=is_w4a16, tp=moe_tp, ep=moe_ep):
+                platform = SimpleNamespace(
+                    is_blackwell=True,
+                    is_sm120=arch == "sm120",
+                    is_sm110=arch == "sm110",
+                )
+                with (
+                    _live_backend(MoeRunnerBackend.AUTO),
+                    mock.patch.object(
+                        modelopt_quant, "get_platform", return_value=platform
+                    ),
+                    mock.patch.object(modelopt_quant, "is_cuda", return_value=False),
+                    mock.patch.object(modelopt_quant, "MoeRunner"),
+                ):
+                    method = ModelOptNvFp4FusedMoEMethod(
+                        SimpleNamespace(
+                            use_per_token_activation=False, is_w4a16=is_w4a16
+                        )
+                    )
+                    method.create_moe_runner(
+                        SimpleNamespace(moe_tp_size=moe_tp, moe_ep_size=moe_ep),
+                        MoeRunnerConfig(
+                            num_experts=NUM_EXPERTS,
+                            num_local_experts=NUM_EXPERTS,
+                            hidden_size=HIDDEN,
+                            intermediate_size_per_partition=INTERMEDIATE,
+                            activation="silu",
+                            is_gated=True,
+                        ),
+                    )
+                    self.assertIs(method.get_moe_runner_backend(None), expected)
+                    uses_cutlass = expected is cutlass
+                    self.assertIs(method.enable_flashinfer_cutlass_moe, uses_cutlass)
+                    self.assertIs(method.load_up_proj_weight_first, uses_cutlass)
+
+    def test_mixed_precision_w4a16_layers_are_marked(self):
+        config = modelopt_quant.ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.mlp.experts": {
+                            "quant_algo": "W4A16_NVFP4",
+                            "group_size": 16,
+                        },
+                        "model.layers.1.mlp.experts": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        },
+                    },
+                }
+            }
+        )
+        self.assertTrue(config.nvfp4a16_config.is_w4a16)
+        self.assertFalse(config.nvfp4_config.is_w4a16)
+
 
 if __name__ == "__main__":
     unittest.main()
