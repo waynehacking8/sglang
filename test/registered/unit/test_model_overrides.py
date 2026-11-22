@@ -1173,10 +1173,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             nvfp4._resolved_overrides,
         )
 
-        # Thor (SM110) and other architectures keep the existing auto behavior.
+        # Other architectures keep the existing auto behavior; SM110 and SM120
+        # are covered by test_sm1xx_modelopt_nvfp4_moe_auto_avoids_trtllm_gen.
         with (
             override_platform(is_sm100=False),
-            override_platform(is_sm120=False),
+            override_platform(is_sm110=False, is_sm120=False),
         ):
             non_sm10x = self._construct(
                 "MiniMaxM2ForCausalLM", "llama", quantization="modelopt_fp4"
@@ -1185,6 +1186,59 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
         self._publish(nvfp4)
         self.assertEqual(get_exec().moe.moe_runner_backend, "flashinfer_trtllm_routed")
+
+    def test_sm1xx_modelopt_nvfp4_moe_auto_avoids_trtllm_gen(self):
+        """On SM110/SM120, auto must not leave an auto-detected ModelOpt NVFP4
+        MoE checkpoint to trtllm-gen, whose MoE kernels are SM100-only."""
+        mixed_w4a16 = {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.layers.0.mlp.experts": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                },
+                "model.layers.0.self_attn.qkv_proj": {"quant_algo": "FP8"},
+            },
+        }
+        mixed_nvfp4 = {
+            "quant_method": "modelopt",
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.layers.0.mlp.experts": {"quant_algo": "NVFP4", "group_size": 16},
+                "model.layers.0.self_attn.qkv_proj": {"quant_algo": "FP8"},
+            },
+        }
+        nvfp4 = {"quant_method": "modelopt", "quant_algo": "NVFP4", "group_size": 16}
+        for platform in (
+            {"is_sm120": True, "is_sm110": False},
+            {"is_sm120": False, "is_sm110": True},
+        ):
+            with self.subTest(**platform):
+                with override_platform(is_sm100=False, **platform):
+                    mixed = self._construct(
+                        "Qwen3MoeForCausalLM",
+                        "llama",
+                        config_extra={"quantization_config": mixed_w4a16},
+                    )
+                    mixed_fp4 = self._construct(
+                        "Qwen3MoeForCausalLM",
+                        "llama",
+                        config_extra={"quantization_config": mixed_nvfp4},
+                    )
+                    plain = self._construct(
+                        "Qwen3MoeForCausalLM",
+                        "llama",
+                        config_extra={"quantization_config": nvfp4},
+                    )
+                self.assertEqual(self._resolved(mixed, "moe_runner_backend"), "marlin")
+                self.assertEqual(
+                    self._resolved(mixed_fp4, "moe_runner_backend"),
+                    "flashinfer_cutlass",
+                )
+                self.assertEqual(
+                    self._resolved(plain, "moe_runner_backend"), "flashinfer_cutlass"
+                )
 
     # ---- Command-A-Plus (Cohere2Moe) MoE runner gate ----
 
@@ -3875,7 +3929,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ),
                 {"moe_runner_backend": "flashinfer_cutlass"},
             )
-        self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
+        with override_platform(is_sm110=False, is_sm120=False):
+            self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
     def test_gguf_quantization_pass(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
