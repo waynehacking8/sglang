@@ -2460,9 +2460,10 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         TRT-LLM is the most performant and tested FP4 MoE backend, so it is the
         default on SM100; Hopper and Ampere fall back to Marlin. trtllm-gen MoE
         kernels are SM100-only, so SM110 and SM120 run W4A4 layers on FlashInfer
-        CUTLASS, which takes only pure TP or pure EP placements, and the rest on
-        Marlin, which keeps W4A16 layers on the 16-bit activations their
-        checkpoint declares.
+        CUTLASS where an explicit ``flashinfer_cutlass`` is accepted (expert
+        parallel size 1 or the tensor parallel size), and the rest on Marlin,
+        which keeps W4A16 layers on the 16-bit activations their checkpoint
+        declares.
         """
         if not moe_runner_backend.is_auto():
             return moe_runner_backend
@@ -2471,7 +2472,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if get_platform().is_sm120 or get_platform().is_sm110:
             parallel = get_parallel()
             if not getattr(self.quant_config, "is_w4a16", False) and (
-                parallel.moe_ep_size == 1 or parallel.moe_tp_size == 1
+                parallel.moe_ep_size in (1, parallel.tp_size)
             ):
                 return MoeRunnerBackend.FLASHINFER_CUTLASS
             return MoeRunnerBackend.MARLIN
