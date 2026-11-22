@@ -161,6 +161,27 @@ class TestNvFp4MoeDispatch(CustomTestCase):
                     quant_info.intermediate_size_per_partition, INTERMEDIATE
                 )
 
+    def test_cutlass_takes_router_weights_on_input(self):
+        """Llama 4 applies its top-1 router weight to the MoE input. The FlashInfer
+        CUTLASS runner pre-scales the hidden states for that (#35504), so apply()
+        must hand such a layer to the runner rather than reject it."""
+        method = _method_set_up_for(MoeRunnerBackend.FLASHINFER_CUTLASS)
+        method.moe_runner_config.apply_router_weight_on_input = True
+        layer = _trtllm_prepared_layer()
+        layer._cutlass_swiglu_params = (None, None, None)
+        layer.w13_blockscale_swizzled = layer.w13_weight_scale
+        layer.w2_blockscale_swizzled = layer.w2_weight_scale
+        layer.w2_input_scale_quant = torch.tensor(2.0, dtype=torch.float32)
+        dispatch_output = object()
+
+        with _live_backend(MoeRunnerBackend.AUTO):
+            out = method.apply(layer, dispatch_output)
+
+        self.assertEqual(out, "combine-input")
+        ((seen_dispatch, quant_info),) = method.runner.calls
+        self.assertIs(seen_dispatch, dispatch_output)
+        self.assertEqual(quant_info.quant_type, "fp4")
+
     def test_dispatch_follows_the_backend_the_runner_was_created_for(self):
         method = _method_set_up_for(MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED)
         for live in (

@@ -29,16 +29,16 @@ from sglang.test.test_utils import CustomTestCase
 
 
 @contextmanager
-def _device(capability: tuple, live: MoeRunnerBackend, moe_tp_ep: tuple = (1, 1)):
+def _device(capability: tuple, live: MoeRunnerBackend, tp_ep: tuple = (1, 1)):
     """A CUDA device of ``capability`` with ``live`` as the process-wide backend
-    and ``moe_tp_ep`` as the MoE (TP, EP) placement."""
+    and ``tp_ep`` as the tensor and expert parallel sizes."""
     is_blackwell = capability >= (10, 0)
     platform = SimpleNamespace(
         is_blackwell=is_blackwell,
         is_sm110=capability[0] == 11,
         is_sm120=capability[0] == 12,
     )
-    parallel = SimpleNamespace(moe_tp_size=moe_tp_ep[0], moe_ep_size=moe_tp_ep[1])
+    parallel = SimpleNamespace(tp_size=tp_ep[0], moe_ep_size=tp_ep[1])
     with (
         mock.patch.object(modelopt_quant, "get_moe_runner_backend", return_value=live),
         mock.patch.object(modelopt_quant, "get_platform", return_value=platform),
@@ -107,20 +107,20 @@ class TestNvFp4MoeAutoBackend(CustomTestCase):
 
     def test_auto_on_sm110_and_sm120_avoids_trtllm_gen(self):
         """trtllm-gen MoE kernels are SM100-only: W4A4 layers run on FlashInfer
-        CUTLASS with pure TP or pure EP, the rest on Marlin, and the weight prep
-        follows the same resolution."""
+        CUTLASS where an explicit flashinfer_cutlass is accepted (EP 1 or TP),
+        the rest on Marlin, and the weight prep follows the same resolution."""
         cutlass, marlin = MoeRunnerBackend.FLASHINFER_CUTLASS, MoeRunnerBackend.MARLIN
-        for capability, is_w4a16, moe_tp_ep, expected in (
+        for capability, is_w4a16, tp_ep, expected in (
             ((12, 0), False, (1, 1), cutlass),
-            ((12, 1), False, (1, 4), cutlass),
+            ((12, 1), False, (4, 4), cutlass),
             ((12, 0), False, (4, 1), cutlass),
-            ((12, 0), False, (2, 2), marlin),
+            ((12, 0), False, (4, 2), marlin),
             ((12, 1), True, (1, 1), marlin),
             ((11, 0), False, (1, 1), cutlass),
             ((11, 0), True, (1, 1), marlin),
         ):
-            with self.subTest(capability=capability, w4a16=is_w4a16, tp_ep=moe_tp_ep):
-                with _device(capability, MoeRunnerBackend.AUTO, moe_tp_ep):
+            with self.subTest(capability=capability, w4a16=is_w4a16, tp_ep=tp_ep):
+                with _device(capability, MoeRunnerBackend.AUTO, tp_ep):
                     method = _method(is_w4a16)
                     _create_runner(method)
                 self.assertIs(method._moe_runner_backend, expected)
