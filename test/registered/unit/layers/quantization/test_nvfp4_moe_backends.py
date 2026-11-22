@@ -204,6 +204,12 @@ class TestNvFp4MoeBackends(CustomTestCase):
     def test_flashinfer_cutlass(self):
         self._run_backend("flashinfer_cutlass")
 
+    def test_auto(self):
+        """auto must prepare the weights for the runner it resolves to (TRT-LLM
+        on SM100, FlashInfer CUTLASS on SM110/SM120); a layer prepared for one
+        runner and dispatched to another fails in its first forward."""
+        self._run_backend("auto")
+
     def test_flashinfer_trtllm(self):
         self._run_backend("flashinfer_trtllm")
 

@@ -97,6 +97,10 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
         runner,
     ):
         quant_method = ModelOptNvFp4FusedMoEMethod.__new__(ModelOptNvFp4FusedMoEMethod)
+        quant_method.quant_config = SimpleNamespace(is_w4a16=False)
+        quant_method._moe_runner_backend = quant_method._resolve_moe_runner_backend(
+            MoeRunnerBackend.AUTO
+        )
         with get_flags().moe.override(runner_backend=MoeRunnerBackend.AUTO):
             experts = self._build_experts(quant_method)
         self.assertIs(experts.runner_backend, MoeRunnerBackend.FLASHINFER_TRTLLM)

@@ -1,7 +1,7 @@
 """CPU unit tests for NVFP4 fused-MoE backend dispatch in ModelOptNvFp4FusedMoEMethod.apply.
 
-apply() picks the kernel path from the backend the method cached in
-create_moe_runner, not from the process-wide MoE runner backend, which
+apply() picks the kernel path from the backend the method resolved in
+__init__, not from the process-wide MoE runner backend, which
 speculative decoding changes after the weights were prepared. These tests pin
 that for the FlashInfer TRT-LLM path, which serves the regular and the routed
 TRT-LLM backend from one weight prep.
@@ -115,7 +115,7 @@ def _method_set_up_for(backend: MoeRunnerBackend) -> ModelOptNvFp4FusedMoEMethod
         mock.patch.object(modelopt_quant, "is_cuda", return_value=False),
     ):
         method = ModelOptNvFp4FusedMoEMethod(
-            SimpleNamespace(use_per_token_activation=False)
+            SimpleNamespace(use_per_token_activation=False, is_w4a16=False)
         )
         method.create_moe_runner(
             SimpleNamespace(),

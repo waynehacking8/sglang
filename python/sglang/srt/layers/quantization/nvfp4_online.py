@@ -119,6 +119,8 @@ class NvFp4OnlineConfig(ModelOptQuantConfig):
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         self.is_fp4_experts = False
         self.dequant_fp4_to_fp8 = False
+        # Online NVFP4 quantizes activations too (W4A4), never W4A16.
+        self.is_w4a16 = False
         self.activation_scheme = activation_scheme
         self.weight_block_size = weight_block_size
         self.use_mxfp8 = use_mxfp8

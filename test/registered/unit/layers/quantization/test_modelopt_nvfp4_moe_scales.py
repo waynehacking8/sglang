@@ -91,7 +91,7 @@ def _nvfp4_loader_layer(*, is_gated=True, tp_rank=0, hidden_size=4096):
         modelopt_quant, "get_platform", return_value=SimpleNamespace(is_blackwell=True)
     ):
         method = ModelOptNvFp4FusedMoEMethod(
-            SimpleNamespace(use_per_token_activation=False)
+            SimpleNamespace(use_per_token_activation=False, is_w4a16=False)
         )
     method.moe_runner_config = config
     layer = FusedMoE.__new__(FusedMoE)

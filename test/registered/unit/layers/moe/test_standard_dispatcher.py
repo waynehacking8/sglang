@@ -667,6 +667,10 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 patch.object(topk_module, "fused_topk", side_effect=cpu_router),
             ):
                 method = object.__new__(ModelOptNvFp4FusedMoEMethod)
+                method.quant_config = SimpleNamespace(is_w4a16=False)
+                method._moe_runner_backend = method._resolve_moe_runner_backend(
+                    MoeRunnerBackend.AUTO
+                )
                 layer = self._build_layer(
                     method, routing_method_type=routing_method_type
                 )
@@ -861,6 +865,7 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 config.n_group = 2
                 config.topk_group = 1
             method = object.__new__(ModelOptNvFp4FusedMoEMethod)
+            method.quant_config = SimpleNamespace(is_w4a16=False)
             with (
                 self.subTest(model=block_type.__name__),
                 get_flags().moe.override(runner_backend=MoeRunnerBackend.AUTO),
@@ -886,6 +891,9 @@ class TestLayerRunnerDispatch(CustomTestCase):
                     topk_module.grouped_topk_gpu._torchdynamo_orig_callable,
                 ),
             ):
+                method._moe_runner_backend = method._resolve_moe_runner_backend(
+                    MoeRunnerBackend.AUTO
+                )
                 block = block_type(config=config, layer_id=0)
                 self.assertEqual(
                     block.experts.runner_backend, MoeRunnerBackend.FLASHINFER_TRTLLM
