@@ -1,5 +1,6 @@
 """Read a checkpoint's quantization settings from its HF config files."""
 
+import json
 import os
 
 # ModelConfig picks the Marlin method for these itself only when --quantization is
@@ -47,14 +48,76 @@ def get_quantization_config(hf_config) -> str | None:
     return None
 
 
-def get_mixed_precision_moe_quant_algos(hf_config) -> set:
+def _modelopt_section(config) -> dict:
+    """The ModelOpt settings of a nested or flat quantization config."""
+    from sglang.srt.configs.model_config import (
+        _quant_config_to_dict,
+        unwrap_modelopt_quantization_config,
+    )
+
+    config = _quant_config_to_dict(config)
+    if not isinstance(config, dict):
+        return {}
+    return unwrap_modelopt_quantization_config(config)
+
+
+def _load_hf_quant_config(model_path: str, revision: str | None) -> dict | None:
+    """hf_quant_config.json from a local model directory or the HF cache."""
+    if os.path.isdir(model_path):
+        path = os.path.join(model_path, "hf_quant_config.json")
+    else:
+        from huggingface_hub import try_to_load_from_cache
+
+        try:
+            path = try_to_load_from_cache(
+                model_path, "hf_quant_config.json", revision=revision
+            )
+        except Exception:  # not a repo id, e.g. a missing local path
+            return None
+    if not isinstance(path, str) or not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def get_modelopt_quant_section(
+    hf_config, model_path: str | None = None, revision: str | None = None
+) -> dict:
+    """ModelOpt settings from config.json, or from hf_quant_config.json when
+    config.json has none, or has a MIXED_PRECISION config without the per-layer
+    map or the KV-cache settings: the cases where the weight loader reads the
+    file (weight_utils.get_quant_config). The file is read when it is local or
+    in the HF cache (ModelConfig downloads it when config.json declares no
+    quantization); otherwise config.json's settings are used."""
+    section = _modelopt_section(getattr(hf_config, "quantization_config", None))
+    needs_file = not section or (
+        str(section.get("quant_algo", "")).upper() == "MIXED_PRECISION"
+        and (
+            "quantized_layers" not in section
+            or (
+                "kv_cache_quant_algo" not in section
+                and "kv_cache_scheme" not in section
+            )
+        )
+    )
+    if needs_file and model_path is not None:
+        section = (
+            _modelopt_section(_load_hf_quant_config(model_path, revision)) or section
+        )
+    return section
+
+
+def get_mixed_precision_moe_quant_algos(
+    hf_config, model_path: str | None = None, revision: str | None = None
+) -> set:
     """quant_algo values ModelOpt MIXED_PRECISION assigns to `*.experts` layers."""
-    quantization_config = getattr(hf_config, "quantization_config", None)
-    if not isinstance(quantization_config, dict):
-        return set()
+    section = get_modelopt_quant_section(hf_config, model_path, revision)
     return {
         str(info.get("quant_algo", "")).upper()
-        for name, info in quantization_config.get("quantized_layers", {}).items()
+        for name, info in (section.get("quantized_layers") or {}).items()
         if ".experts" in name and isinstance(info, dict)
     }
 
