@@ -69,7 +69,7 @@ from sglang.srt.layers.quantization.utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
 from sglang.srt.layers.utils.common import set_weight_attrs
-from sglang.srt.runtime_context import get_exec, get_platform
+from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
 from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.device import get_device_capability, is_cuda
@@ -977,6 +977,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             group_size=group_size,
             use_per_token_activation=False,
         )
+        nvfp4a16_config.is_w4a16 = True
 
         return cls(
             kv_cache_quant_algo=kv_cache_quant_algo,
@@ -2451,27 +2452,35 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         self._cache_permute_indices = {}
 
-    @staticmethod
     def _resolve_moe_runner_backend(
-        moe_runner_backend: MoeRunnerBackend,
+        self, moe_runner_backend: MoeRunnerBackend
     ) -> MoeRunnerBackend:
         """The backend ``auto`` stands for on this device.
 
         TRT-LLM is the most performant and tested FP4 MoE backend, so it is the
-        default on Blackwell; Hopper and Ampere fall back to Marlin.
+        default on SM100; Hopper and Ampere fall back to Marlin. trtllm-gen MoE
+        kernels are SM100-only, so SM110 and SM120 run W4A4 layers on FlashInfer
+        CUTLASS, which takes only pure TP or pure EP placements, and the rest on
+        Marlin, which keeps W4A16 layers on the 16-bit activations their
+        checkpoint declares.
         """
         if not moe_runner_backend.is_auto():
             return moe_runner_backend
         if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
             return MoeRunnerBackend.MARLIN
+        if get_platform().is_sm120 or get_platform().is_sm110:
+            parallel = get_parallel()
+            if not getattr(self.quant_config, "is_w4a16", False) and (
+                parallel.moe_ep_size == 1 or parallel.moe_tp_size == 1
+            ):
+                return MoeRunnerBackend.FLASHINFER_CUTLASS
+            return MoeRunnerBackend.MARLIN
         return MoeRunnerBackend.FLASHINFER_TRTLLM
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
-        from sglang.srt.layers.moe import get_moe_runner_backend
-
-        """Access the global enable_flashinfer_cutlass_moe setting."""
-        return get_moe_runner_backend().is_flashinfer_cutlass()
+        """Whether this layer runs FlashInfer CUTLASS (its resolved backend)."""
+        return self._moe_runner_backend.is_flashinfer_cutlass()
 
     @property
     def enable_flashinfer_cutedsl_moe(self) -> bool:
@@ -3017,7 +3026,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ("w2", layer.w2_weight_scale),
         ]:
             # For NVFP4 TRTLLM we require one scale per 16 inputs (last dim == expected_blocks[name]).
-            if get_moe_runner_backend().is_flashinfer_trtllm():
+            if self._moe_runner_backend.is_flashinfer_trtllm():
                 expected_blocks = {
                     "w13": layer.w13_weight.shape[2] * 2 // block_size,
                     "w2": layer.w2_weight.shape[2] * 2 // block_size,

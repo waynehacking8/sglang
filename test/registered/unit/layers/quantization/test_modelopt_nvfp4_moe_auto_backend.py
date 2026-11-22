@@ -29,16 +29,20 @@ from sglang.test.test_utils import CustomTestCase
 
 
 @contextmanager
-def _device(capability: tuple, live: MoeRunnerBackend):
-    """A CUDA device of ``capability`` with ``live`` as the process-wide backend."""
+def _device(capability: tuple, live: MoeRunnerBackend, moe_tp_ep: tuple = (1, 1)):
+    """A CUDA device of ``capability`` with ``live`` as the process-wide backend
+    and ``moe_tp_ep`` as the MoE (TP, EP) placement."""
     is_blackwell = capability >= (10, 0)
+    platform = SimpleNamespace(
+        is_blackwell=is_blackwell,
+        is_sm110=capability[0] == 11,
+        is_sm120=capability[0] == 12,
+    )
+    parallel = SimpleNamespace(moe_tp_size=moe_tp_ep[0], moe_ep_size=moe_tp_ep[1])
     with (
         mock.patch.object(modelopt_quant, "get_moe_runner_backend", return_value=live),
-        mock.patch.object(
-            modelopt_quant,
-            "get_platform",
-            return_value=SimpleNamespace(is_blackwell=is_blackwell),
-        ),
+        mock.patch.object(modelopt_quant, "get_platform", return_value=platform),
+        mock.patch.object(modelopt_quant, "get_parallel", return_value=parallel),
         mock.patch.object(modelopt_quant, "is_cuda", return_value=True),
         mock.patch.object(
             modelopt_quant, "get_device_capability", return_value=capability
@@ -47,8 +51,10 @@ def _device(capability: tuple, live: MoeRunnerBackend):
         yield
 
 
-def _method() -> ModelOptNvFp4FusedMoEMethod:
-    return ModelOptNvFp4FusedMoEMethod(SimpleNamespace(use_per_token_activation=False))
+def _method(is_w4a16: bool = False) -> ModelOptNvFp4FusedMoEMethod:
+    return ModelOptNvFp4FusedMoEMethod(
+        SimpleNamespace(use_per_token_activation=False, is_w4a16=is_w4a16)
+    )
 
 
 def _create_runner(method: ModelOptNvFp4FusedMoEMethod) -> None:
@@ -98,6 +104,57 @@ class TestNvFp4MoeAutoBackend(CustomTestCase):
                     _create_runner(method)
                 self.assertIs(method._moe_runner_backend, live)
                 self.assertEqual(method.enable_flashinfer_trtllm_moe, is_trtllm)
+
+    def test_auto_on_sm110_and_sm120_avoids_trtllm_gen(self):
+        """trtllm-gen MoE kernels are SM100-only: W4A4 layers run on FlashInfer
+        CUTLASS with pure TP or pure EP, the rest on Marlin, and the weight prep
+        follows the same resolution."""
+        cutlass, marlin = MoeRunnerBackend.FLASHINFER_CUTLASS, MoeRunnerBackend.MARLIN
+        for capability, is_w4a16, moe_tp_ep, expected in (
+            ((12, 0), False, (1, 1), cutlass),
+            ((12, 1), False, (1, 4), cutlass),
+            ((12, 0), False, (4, 1), cutlass),
+            ((12, 0), False, (2, 2), marlin),
+            ((12, 1), True, (1, 1), marlin),
+            ((11, 0), False, (1, 1), cutlass),
+            ((11, 0), True, (1, 1), marlin),
+        ):
+            with self.subTest(capability=capability, w4a16=is_w4a16, tp_ep=moe_tp_ep):
+                with _device(capability, MoeRunnerBackend.AUTO, moe_tp_ep):
+                    method = _method(is_w4a16)
+                    _create_runner(method)
+                self.assertIs(method._moe_runner_backend, expected)
+                self.assertFalse(method.enable_flashinfer_trtllm_moe)
+                self.assertFalse(method.use_flashinfer_trtllm_weight_layout)
+                uses_cutlass = expected is cutlass
+                self.assertIs(method.enable_flashinfer_cutlass_moe, uses_cutlass)
+                with mock.patch.object(
+                    modelopt_quant,
+                    "get_moe_runner_backend",
+                    return_value=MoeRunnerBackend.AUTO,
+                ):
+                    self.assertIs(method.load_up_proj_weight_first, uses_cutlass)
+
+    def test_mixed_precision_marks_its_w4a16_layers(self):
+        config = modelopt_quant.ModelOptMixedPrecisionConfig.from_config(
+            {
+                "quantization": {
+                    "quant_algo": "MIXED_PRECISION",
+                    "quantized_layers": {
+                        "model.layers.0.mlp.experts": {
+                            "quant_algo": "W4A16_NVFP4",
+                            "group_size": 16,
+                        },
+                        "model.layers.1.mlp.experts": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        },
+                    },
+                }
+            }
+        )
+        self.assertTrue(config.nvfp4a16_config.is_w4a16)
+        self.assertFalse(config.nvfp4_config.is_w4a16)
 
 
 if __name__ == "__main__":
