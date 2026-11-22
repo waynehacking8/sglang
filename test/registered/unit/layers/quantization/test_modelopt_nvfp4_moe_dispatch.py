@@ -161,6 +161,55 @@ class TestNvFp4MoeDispatch(CustomTestCase):
                     quant_info.intermediate_size_per_partition, INTERMEDIATE
                 )
 
+    def test_cutlass_takes_router_weights_on_input(self):
+        """Llama 4 applies its top-1 router weight to the MoE input. The FlashInfer
+        CUTLASS runner pre-scales the hidden states for that (#35504; it still
+        rejects activations quantized before dispatch), so apply() must hand
+        such a layer to the runner rather than reject it."""
+        method = _method_set_up_for(MoeRunnerBackend.FLASHINFER_CUTLASS)
+        method.moe_runner_config.apply_router_weight_on_input = True
+        layer = _trtllm_prepared_layer()
+        layer._cutlass_swiglu_params = (None, None, None)
+        layer.w13_blockscale_swizzled = layer.w13_weight_scale
+        layer.w2_blockscale_swizzled = layer.w2_weight_scale
+        layer.w2_input_scale_quant = torch.tensor(2.0, dtype=torch.float32)
+        dispatch_output = object()
+
+        with _live_backend(MoeRunnerBackend.AUTO):
+            out = method.apply(layer, dispatch_output)
+
+        self.assertEqual(out, "combine-input")
+        ((seen_dispatch, quant_info),) = method.runner.calls
+        self.assertIs(seen_dispatch, dispatch_output)
+        self.assertEqual(quant_info.quant_type, "fp4")
+
+    def test_cutlass_prescales_top1_router_weights(self):
+        """Llama 4's router weight belongs on the MoE input. The CUTLASS runner
+        scales each token's hidden states by its top-1 weight and passes unit
+        final scales, so the weight is applied once and before the experts."""
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
+            _prescale_router_weight_on_input,
+        )
+
+        hidden = torch.arange(12, dtype=torch.bfloat16).reshape(3, 4)
+        weights = torch.tensor([[0.5], [2.0], [0.25]], dtype=torch.float32)
+        ids = torch.tensor([[1], [0], [3]], dtype=torch.int32)
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=hidden,
+            hidden_states_scale=None,
+            topk_output=StandardTopKOutput(weights, ids, torch.zeros(3, NUM_EXPERTS)),
+        )
+        config = SimpleNamespace(apply_router_weight_on_input=True)
+
+        out = _prescale_router_weight_on_input(dispatch_output, config)
+
+        torch.testing.assert_close(out.hidden_states, hidden * weights.to(hidden.dtype))
+        self.assertEqual(out.topk_output.topk_weights.dtype, torch.float32)
+        torch.testing.assert_close(
+            out.topk_output.topk_weights, torch.ones_like(weights)
+        )
+        self.assertIs(out.topk_output.topk_ids, ids)
+
     def test_dispatch_follows_the_backend_the_runner_was_created_for(self):
         method = _method_set_up_for(MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED)
         for live in (

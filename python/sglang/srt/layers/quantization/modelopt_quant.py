@@ -3238,6 +3238,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 "Use --moe-runner-backend flashinfer_cutlass instead."
             )
 
+        if (
+            moe_runner_backend.is_marlin()
+            and moe_runner_config.apply_router_weight_on_input
+        ):
+            # Marlin multiplies router weights into the expert output.
+            raise ValueError(
+                "NVFP4 MoE on Marlin applies router weights to the expert "
+                "output, but this layer applies them to its input "
+                "(apply_router_weight_on_input). flashinfer_cutlass handles "
+                "that for top-1 routing on SM100 and newer."
+            )
+
         self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def get_moe_runner_backend(self, layer):
@@ -3428,9 +3440,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 FlashInferCutlassMoeQuantInfo,
             )
 
-            assert not self.moe_runner_config.apply_router_weight_on_input, (
-                "apply_router_weight_on_input is not supported for Flashinfer"
-            )
             swiglu_alpha, swiglu_beta, swiglu_limit = layer._cutlass_swiglu_params
             slot = getattr(layer, "_nvfp4_layout_slot", None)
             pair_weight = slot[0].pair[slot[1]] if slot and slot[0].is_pair else None

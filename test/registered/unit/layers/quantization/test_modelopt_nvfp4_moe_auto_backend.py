@@ -48,7 +48,9 @@ def _method(is_w4a16: bool = False) -> ModelOptNvFp4FusedMoEMethod:
     )
 
 
-def _create_runner(method: ModelOptNvFp4FusedMoEMethod) -> MoeRunnerBackend:
+def _create_runner(
+    method: ModelOptNvFp4FusedMoEMethod, apply_router_weight_on_input: bool = False
+) -> MoeRunnerBackend:
     """Run create_moe_runner and return the backend it built MoeRunner with."""
     with mock.patch.object(modelopt_quant, "MoeRunner") as runner:
         method.create_moe_runner(
@@ -60,6 +62,7 @@ def _create_runner(method: ModelOptNvFp4FusedMoEMethod) -> MoeRunnerBackend:
                 intermediate_size_per_partition=32,
                 activation="silu",
                 is_gated=True,
+                apply_router_weight_on_input=apply_router_weight_on_input,
             ),
         )
     runner.assert_called_once()
@@ -149,6 +152,27 @@ class TestNvFp4MoeAutoBackend(CustomTestCase):
             method = _method()
         with _device((12, 0), MoeRunnerBackend.FLASHINFER_TRTLLM):
             runner = _create_runner(method)
+        self.assertIs(runner, MoeRunnerBackend.FLASHINFER_CUTLASS)
+
+    def test_marlin_refuses_router_weights_on_the_input(self):
+        """Marlin applies router weights to the expert output, so a layer that
+        applies them to its input (Llama 4) stops at startup wherever its
+        backend resolves to Marlin, and still builds on CUTLASS."""
+        for capability, tp_ep, is_w4a16 in (
+            ((9, 0), (1, 1), False),
+            ((12, 0), (4, 2), False),
+            ((12, 0), (1, 1), True),
+        ):
+            with self.subTest(capability=capability, tp_ep=tp_ep, w4a16=is_w4a16):
+                with _device(capability, MoeRunnerBackend.AUTO, tp_ep):
+                    method = _method(is_w4a16)
+                    with self.assertRaisesRegex(
+                        ValueError, "apply_router_weight_on_input"
+                    ):
+                        _create_runner(method, apply_router_weight_on_input=True)
+        with _device((12, 0), MoeRunnerBackend.AUTO):
+            method = _method()
+            runner = _create_runner(method, apply_router_weight_on_input=True)
         self.assertIs(runner, MoeRunnerBackend.FLASHINFER_CUTLASS)
 
     def test_online_quantization_resolves_like_a_w4a4_checkpoint(self):
