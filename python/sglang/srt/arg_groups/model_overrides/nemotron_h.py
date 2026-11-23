@@ -129,8 +129,10 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Use marlin as MoE runner backend on SM80-SM90 for "
                 f"{model_arch} {model_config.quantization}"
             )
-        elif quantization == "modelopt_fp4" and (
-            get_platform().is_sm120 or get_platform().is_sm110
+        elif (
+            quantization == "modelopt_fp4"
+            and cfg.moe_a2a_backend == "none"
+            and (get_platform().is_sm120 or get_platform().is_sm110)
         ):
             # Keep auto: ModelOptNvFp4FusedMoEMethod picks CUTLASS or Marlin per
             # layer, from the layer's quant config (W4A16 or W4A4) and the EP size.

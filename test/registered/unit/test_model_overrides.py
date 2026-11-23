@@ -3002,7 +3002,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         _nemotron_h_overrides(_args(mc_quant, checkpoint), checkpoint),
                         {"quantization": "modelopt_fp4"},
                     )
-                # FP8 and unquantized checkpoints keep the CUTLASS default.
+                # An A2A backend, FP8 and unquantized checkpoints keep CUTLASS.
+                self.assertEqual(
+                    _nemotron_h_overrides(
+                        _args("modelopt_fp4", hf, moe_a2a_backend="deepep"), hf
+                    ),
+                    {
+                        "quantization": "modelopt_fp4",
+                        "moe_runner_backend": "flashinfer_cutlass",
+                    },
+                )
                 self.assertEqual(
                     _nemotron_h_overrides(_args("modelopt_fp8", hf_fp8), hf_fp8),
                     {
@@ -3907,7 +3916,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     {"moe_runner_backend": "triton"},
                 )
         # modelopt_fp4 keeps auto on SM110/SM120: the NVFP4 MoE method resolves
-        # it per layer (W4A16 layers take Marlin).
+        # it per layer (W4A16 layers take Marlin). An A2A backend needs CUTLASS.
         for platform in ("is_sm110", "is_sm120"):
             with override_platform(**{platform: True}):
                 self.assertEqual(
@@ -3915,6 +3924,15 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         _view(quantization="modelopt_fp4")
                     ),
                     {},
+                )
+                self.assertEqual(
+                    _moe_runner_backend_quant_constraints(
+                        _view(
+                            quantization="modelopt_fp4",
+                            moe_a2a_backend="flashinfer_nvlink_one_sided",
+                        )
+                    ),
+                    {"moe_runner_backend": "flashinfer_cutlass"},
                 )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 

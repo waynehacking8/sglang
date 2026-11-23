@@ -1825,8 +1825,20 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 moe_runner_backend,
             )
             moe_runner_backend = mxfp8_default
-    # modelopt_fp4 keeps auto: ModelOptNvFp4FusedMoEMethod resolves it per layer
-    # from the layer's own quant config (W4A16 or W4A4) and the EP size.
+    # Without an A2A backend, modelopt_fp4 keeps auto: ModelOptNvFp4FusedMoEMethod
+    # resolves it per layer, from the layer's quant config and the EP size.
+    if (
+        moe_runner_backend == "auto"
+        and view.quantization == "modelopt_fp4"
+        and view.moe_a2a_backend != "none"
+        and (get_platform().is_sm120 or get_platform().is_sm110)
+    ):
+        # An A2A backend needs one concrete runner (handle_a2a_moe asserts it).
+        moe_runner_backend = "flashinfer_cutlass"
+        logger.info(
+            "Use flashinfer_cutlass as MoE runner backend on SM110/SM120 for "
+            "modelopt_fp4 with an A2A backend (trtllm-gen MoE kernels are SM100-only)"
+        )
     if moe_runner_backend != view.moe_runner_backend:
         return {"moe_runner_backend": moe_runner_backend}
     return {}

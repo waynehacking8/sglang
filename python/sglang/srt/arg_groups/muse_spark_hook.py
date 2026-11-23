@@ -88,7 +88,7 @@ def _apply_muse_spark_launch_defaults(server_args: Any) -> None:
     quantization = defaults.get("quantization", cfg.quantization)
     if quantization == "modelopt_fp4" and cfg.moe_runner_backend == "auto":
         # TRT-LLM FP4 MoE supports data-center Blackwell (SM100/SM103),
-        # not the SM120 consumer cards handled by the generic Cutlass default.
+        # not the SM120 consumer cards.
         if platform.is_sm100:
             defaults["moe_runner_backend"] = "flashinfer_trtllm"
         elif platform.is_sm90:
