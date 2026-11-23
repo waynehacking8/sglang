@@ -664,6 +664,10 @@ class TestLayerRunnerDispatch(CustomTestCase):
                     "sglang.srt.layers.quantization.modelopt_quant.get_device_capability",
                     return_value=(10, 0),
                 ),
+                patch(
+                    "sglang.srt.layers.quantization.modelopt_quant.torch.cuda.current_device",
+                    return_value=0,
+                ),
                 patch.object(topk_module, "fused_topk", side_effect=cpu_router),
             ):
                 method = object.__new__(ModelOptNvFp4FusedMoEMethod)
@@ -882,6 +886,10 @@ class TestLayerRunnerDispatch(CustomTestCase):
                 patch(
                     "sglang.srt.layers.quantization.modelopt_quant.get_device_capability",
                     return_value=(10, 0),
+                ),
+                patch(
+                    "sglang.srt.layers.quantization.modelopt_quant.torch.cuda.current_device",
+                    return_value=0,
                 ),
                 patch.object(llada2, "_is_npu", False),
                 patch.object(topk_module, "fused_topk", side_effect=cpu_router),

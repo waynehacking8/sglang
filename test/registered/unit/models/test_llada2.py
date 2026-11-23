@@ -86,6 +86,10 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
 
     @patch("sglang.srt.layers.quantization.modelopt_quant.MoeRunner")
     @patch(
+        "sglang.srt.layers.quantization.modelopt_quant.torch.cuda.current_device",
+        return_value=0,
+    )
+    @patch(
         "sglang.srt.layers.quantization.modelopt_quant.get_device_capability",
         return_value=(10, 0),
     )
@@ -94,6 +98,7 @@ class TestLLaDA2BlockRoutingValidation(CustomTestCase):
         self,
         _is_cuda,
         _capability,
+        _current_device,
         runner,
     ):
         quant_method = ModelOptNvFp4FusedMoEMethod.__new__(ModelOptNvFp4FusedMoEMethod)

@@ -47,6 +47,14 @@ def get_quantization_config(hf_config) -> str | None:
     return None
 
 
+def is_w4a16_nvfp4_checkpoint(hf_config) -> bool:
+    """Whether config.json declares ModelOpt W4A16_NVFP4 for the whole checkpoint."""
+    quantization_config = getattr(hf_config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        return False
+    return str(quantization_config.get("quant_algo", "")).upper() == "W4A16_NVFP4"
+
+
 def has_fp8_weights_in_checkpoint(model_path: str) -> bool:
     """Check if a model checkpoint actually contains FP8 (float8_e4m3fn) expert
     weight tensors by reading safetensors metadata headers.

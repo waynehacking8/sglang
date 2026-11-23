@@ -9,7 +9,9 @@ from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolving_view,
 )
+from sglang.srt.configs.quant_utils import is_w4a16_nvfp4_checkpoint
 from sglang.srt.environ import envs
+from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -47,10 +49,10 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
             quant_algo = model_config.hf_config.quantization_config["quant_algo"]
             if quant_algo == "MIXED_PRECISION":
                 quantization = "modelopt_mixed"
+            elif canonicalize_modelopt_quant_algo(quant_algo) == "modelopt_fp4":
+                quantization = "modelopt_fp4"
             else:
-                quantization = (
-                    "modelopt_fp4" if quant_algo == "NVFP4" else "modelopt_fp8"
-                )
+                quantization = "modelopt_fp8"
         else:
             quantization = model_config.quantization
         overrides["quantization"] = quantization
@@ -93,6 +95,14 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Use marlin as MoE runner backend for "
                 f"{model_arch} with W4A16_NVFP4 MoE layers"
             )
+    elif (
+        quantization == "modelopt_fp4"
+        and is_w4a16_nvfp4_checkpoint(hf_config)
+        and cfg.moe_runner_backend == "auto"
+        and cfg.moe_a2a_backend == "none"
+    ):
+        # Keep auto: ModelOptNvFp4FusedMoEMethod runs W4A16 experts on Marlin.
+        pass
     elif (
         uses_expert_remap
         and cfg.moe_runner_backend == "auto"

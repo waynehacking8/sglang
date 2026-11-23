@@ -2977,6 +2977,57 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         },
                     )
 
+        # A top-level W4A16_NVFP4 checkpoint keeps auto on every GPU, so the NVFP4
+        # MoE method runs its experts on Marlin; W4A4 NVFP4 keeps the defaults.
+        # The attention backend is set so only the MoE choices show.
+        hf_w4a16 = _hf("W4A16_NVFP4")
+        hf_fp8 = _hf("FP8")
+        attn = {"attention_backend": "triton"}
+        for capability, is_sm110 in (((12, 0), False), ((11, 0), True)):
+            with (
+                self.subTest(capability=capability),
+                override_platform(is_sm100=False),
+                override_platform(is_sm110=is_sm110),
+                override_platform(is_sm120=not is_sm110),
+                override_platform(is_blackwell=True),
+                override_platform(is_hip=False),
+                override_platform(is_cuda=True),
+                override_platform(device_capability=capability),
+            ):
+                for mc_quant in ("modelopt_fp4", "modelopt"):
+                    self.assertEqual(
+                        _nemotron_h_overrides(_args(mc_quant, hf, **attn), hf),
+                        {
+                            "quantization": "modelopt_fp4",
+                            "moe_runner_backend": "flashinfer_cutlass",
+                        },
+                    )
+                    self.assertEqual(
+                        _nemotron_h_overrides(
+                            _args(mc_quant, hf_w4a16, **attn), hf_w4a16
+                        ),
+                        {"quantization": "modelopt_fp4"},
+                    )
+                self.assertEqual(
+                    _nemotron_h_overrides(
+                        _args("modelopt_fp8", hf_fp8, **attn), hf_fp8
+                    ),
+                    {
+                        "quantization": "modelopt_fp8",
+                        "moe_runner_backend": "flashinfer_cutlass",
+                    },
+                )
+        with (
+            override_platform(is_sm100=True),
+            override_platform(is_blackwell=True),
+        ):
+            self.assertEqual(
+                _nemotron_h_overrides(
+                    _args("modelopt_fp4", hf_w4a16, **attn), hf_w4a16
+                ),
+                {"quantization": "modelopt_fp4"},
+            )
+
     def test_speculative_moe_runner_default_pass(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import _speculative_moe_runner_default
@@ -3868,13 +3919,36 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _moe_runner_backend_quant_constraints(_view(**aiter_view)),
                     {"moe_runner_backend": "triton"},
                 )
-        with override_platform(is_sm120=True):
-            self.assertEqual(
-                _moe_runner_backend_quant_constraints(
-                    _view(quantization="modelopt_fp4")
-                ),
-                {"moe_runner_backend": "flashinfer_cutlass"},
-            )
+        # On SM110/SM120, modelopt_fp4 gets flashinfer_cutlass, except that a
+        # top-level W4A16_NVFP4 checkpoint without an A2A backend keeps auto,
+        # which the NVFP4 MoE method runs on Marlin.
+        cutlass = {"moe_runner_backend": "flashinfer_cutlass"}
+        for platform in ("is_sm110", "is_sm120"):
+            for quant_algo, a2a, expected in (
+                ("NVFP4", "none", cutlass),
+                ("NVFP4", "flashinfer_nvlink_one_sided", cutlass),
+                ("W4A16_NVFP4", "none", {}),
+                ("W4A16_NVFP4", "flashinfer_nvlink_one_sided", cutlass),
+            ):
+                model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(
+                        quantization_config={"quant_algo": quant_algo}
+                    )
+                )
+                with (
+                    self.subTest(platform=platform, quant_algo=quant_algo, a2a=a2a),
+                    override_platform(**{platform: True}),
+                    patch(
+                        "sglang.srt.arg_groups.overrides.model_config_of",
+                        return_value=model_config,
+                    ),
+                ):
+                    self.assertEqual(
+                        _moe_runner_backend_quant_constraints(
+                            _view(quantization="modelopt_fp4", moe_a2a_backend=a2a)
+                        ),
+                        expected,
+                    )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
     def test_gguf_quantization_pass(self):
@@ -4623,6 +4697,31 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _qwen3_moe_family_overrides(args, _mixed("W4A16_NVFP4")),
                 {"moe_runner_backend": "marlin"},
             )
+            # A top-level W4A16_NVFP4 checkpoint keeps auto, which the NVFP4 MoE
+            # method runs on Marlin; NVFP4 still takes trtllm-gen.
+            for quant_algo, expected in (
+                ("W4A16_NVFP4", {}),
+                ("NVFP4", {"moe_runner_backend": "flashinfer_trtllm"}),
+            ):
+                with self.subTest(quant_algo=quant_algo):
+                    self.assertEqual(
+                        _qwen3_moe_family_overrides(
+                            SimpleNamespace(
+                                quantization="modelopt_fp4",
+                                _quantization_explicitly_unset=False,
+                                moe_a2a_backend="none",
+                                moe_runner_backend="auto",
+                            ),
+                            SimpleNamespace(
+                                architectures=["Qwen3MoeForCausalLM"],
+                                quantization_config={
+                                    "quant_method": "modelopt",
+                                    "quant_algo": quant_algo,
+                                },
+                            ),
+                        ),
+                        expected,
+                    )
 
     def test_qwen3_moe_family_w4a16_explicit_runner(self):
         """Keep opted-in CuTe DSL v2 W4A16 accepted and auto routed to Marlin."""

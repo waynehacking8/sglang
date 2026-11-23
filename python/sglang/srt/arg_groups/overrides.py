@@ -56,6 +56,7 @@ logger = logging.getLogger(__name__)
 from sglang.srt.configs.quant_utils import (
     LOADER_RESOLVED_QUANT_METHODS,
     get_quantization_config,
+    is_w4a16_nvfp4_checkpoint,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -1829,6 +1830,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
         moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"
         and (get_platform().is_sm120 or get_platform().is_sm110)
+        # W4A16 experts keep auto, which ModelOptNvFp4FusedMoEMethod runs on
+        # Marlin; Marlin has no A2A path.
+        and not (
+            view.moe_a2a_backend == "none"
+            and is_w4a16_nvfp4_checkpoint(model_config_of(view).hf_config)
+        )
     ):
         moe_runner_backend = "flashinfer_cutlass"
         logger.info(
