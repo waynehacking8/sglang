@@ -2977,6 +2977,44 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         },
                     )
 
+        # SM110/SM120 modelopt_fp4 keeps auto so each NVFP4 MoE layer resolves its
+        # runner from its own quant config; a W4A16 layer must not get CUTLASS.
+        hf_w4a16 = _hf("W4A16_NVFP4")
+        hf_fp8 = _hf("FP8")
+        for capability, is_sm110 in (((12, 0), False), ((11, 0), True)):
+            with (
+                self.subTest(capability=capability),
+                override_platform(is_sm100=False),
+                override_platform(is_sm110=is_sm110),
+                override_platform(is_sm120=not is_sm110),
+                override_platform(is_blackwell=False),
+                override_platform(is_hip=False),
+                override_platform(is_cuda=True),
+                override_platform(device_capability=capability),
+            ):
+                for mc_quant, checkpoint in (
+                    ("modelopt_fp4", hf),
+                    ("modelopt_fp4", hf_w4a16),
+                    ("modelopt", hf),
+                    ("modelopt", hf_w4a16),
+                ):
+                    self.assertEqual(
+                        _nemotron_h_overrides(_args(mc_quant, checkpoint), checkpoint),
+                        {"quantization": "modelopt_fp4"},
+                    )
+                # FP8 and unquantized checkpoints keep the CUTLASS default.
+                self.assertEqual(
+                    _nemotron_h_overrides(_args("modelopt_fp8", hf_fp8), hf_fp8),
+                    {
+                        "quantization": "modelopt_fp8",
+                        "moe_runner_backend": "flashinfer_cutlass",
+                    },
+                )
+                self.assertEqual(
+                    _nemotron_h_overrides(_args(None, hf), hf),
+                    {"moe_runner_backend": "flashinfer_cutlass"},
+                )
+
     def test_speculative_moe_runner_default_pass(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import _speculative_moe_runner_default
@@ -3868,13 +3906,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _moe_runner_backend_quant_constraints(_view(**aiter_view)),
                     {"moe_runner_backend": "triton"},
                 )
-        with override_platform(is_sm120=True):
-            self.assertEqual(
-                _moe_runner_backend_quant_constraints(
-                    _view(quantization="modelopt_fp4")
-                ),
-                {"moe_runner_backend": "flashinfer_cutlass"},
-            )
+        # modelopt_fp4 keeps auto on SM110/SM120: the NVFP4 MoE method resolves
+        # it per layer (W4A16 layers take Marlin).
+        for platform in ("is_sm110", "is_sm120"):
+            with override_platform(**{platform: True}):
+                self.assertEqual(
+                    _moe_runner_backend_quant_constraints(
+                        _view(quantization="modelopt_fp4")
+                    ),
+                    {},
+                )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
     def test_gguf_quantization_pass(self):

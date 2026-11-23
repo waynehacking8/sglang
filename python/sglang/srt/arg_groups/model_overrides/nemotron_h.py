@@ -10,6 +10,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -47,10 +48,10 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
             quant_algo = model_config.hf_config.quantization_config["quant_algo"]
             if quant_algo == "MIXED_PRECISION":
                 quantization = "modelopt_mixed"
+            elif canonicalize_modelopt_quant_algo(quant_algo) == "modelopt_fp4":
+                quantization = "modelopt_fp4"
             else:
-                quantization = (
-                    "modelopt_fp4" if quant_algo == "NVFP4" else "modelopt_fp8"
-                )
+                quantization = "modelopt_fp8"
         else:
             quantization = model_config.quantization
         overrides["quantization"] = quantization
@@ -128,6 +129,12 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Use marlin as MoE runner backend on SM80-SM90 for "
                 f"{model_arch} {model_config.quantization}"
             )
+        elif quantization == "modelopt_fp4" and (
+            get_platform().is_sm120 or get_platform().is_sm110
+        ):
+            # Keep auto: ModelOptNvFp4FusedMoEMethod picks CUTLASS or Marlin per
+            # layer, from the layer's quant config (W4A16 or W4A4) and the EP size.
+            pass
         else:
             overrides["moe_runner_backend"] = "flashinfer_cutlass"
 
