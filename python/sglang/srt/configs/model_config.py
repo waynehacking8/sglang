@@ -2054,6 +2054,12 @@ class ModelConfig:
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
         return quant_cfg
 
+    def is_w4a16_nvfp4_checkpoint(self) -> bool:
+        """Whether the checkpoint declares ModelOpt W4A16_NVFP4 for all its
+        layers, in config.json or hf_quant_config.json."""
+        quant_cfg = self._parse_quant_hf_config() or {}
+        return str(quant_cfg.get("quant_algo", "")).upper() == "W4A16_NVFP4"
+
     def _find_quant_modelslim_config(self):
         if self.is_draft_model:
             return None

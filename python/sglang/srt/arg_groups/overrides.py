@@ -56,7 +56,6 @@ logger = logging.getLogger(__name__)
 from sglang.srt.configs.quant_utils import (
     LOADER_RESOLVED_QUANT_METHODS,
     get_quantization_config,
-    is_w4a16_nvfp4_checkpoint,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -1826,16 +1825,27 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 moe_runner_backend,
             )
             moe_runner_backend = mxfp8_default
+    is_w4a16_auto = (
+        moe_runner_backend == "auto"
+        and view.quantization == "modelopt_fp4"
+        and get_platform().is_cuda
+        and model_config_of(view).is_w4a16_nvfp4_checkpoint()
+    )
+    if is_w4a16_auto and view.moe_a2a_backend not in ("none", "flashinfer_megamoe"):
+        # W4A16 experts keep auto, which ModelOptNvFp4FusedMoEMethod resolves to
+        # Marlin, the runner that keeps their 16-bit activations. Marlin has no
+        # A2A path; MegaMoE sets its own runner later.
+        raise ValueError(
+            "Under --moe-runner-backend auto, W4A16_NVFP4 MoE layers run on "
+            "Marlin, which has no A2A path. Launch with --moe-a2a-backend none, "
+            "or on SM100-family GPUs pass --moe-runner-backend flashinfer_cutedsl "
+            "with SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1."
+        )
     if (
         moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"
         and (get_platform().is_sm120 or get_platform().is_sm110)
-        # W4A16 experts keep auto, which ModelOptNvFp4FusedMoEMethod runs on
-        # Marlin; Marlin has no A2A path.
-        and not (
-            view.moe_a2a_backend == "none"
-            and is_w4a16_nvfp4_checkpoint(model_config_of(view).hf_config)
-        )
+        and not is_w4a16_auto
     ):
         moe_runner_backend = "flashinfer_cutlass"
         logger.info(

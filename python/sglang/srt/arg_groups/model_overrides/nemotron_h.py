@@ -9,7 +9,6 @@ from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolving_view,
 )
-from sglang.srt.configs.quant_utils import is_w4a16_nvfp4_checkpoint
 from sglang.srt.environ import envs
 from sglang.srt.layers.modelopt_utils import canonicalize_modelopt_quant_algo
 from sglang.srt.runtime_context import get_platform
@@ -97,11 +96,12 @@ def _nemotron_h_overrides(server_args: Any, hf_config: Any) -> dict:
             )
     elif (
         quantization == "modelopt_fp4"
-        and is_w4a16_nvfp4_checkpoint(hf_config)
         and cfg.moe_runner_backend == "auto"
-        and cfg.moe_a2a_backend == "none"
+        and model_config.is_w4a16_nvfp4_checkpoint()
     ):
-        # Keep auto: ModelOptNvFp4FusedMoEMethod runs W4A16 experts on Marlin.
+        # Keep auto: ModelOptNvFp4FusedMoEMethod runs W4A16 experts on Marlin,
+        # and _moe_runner_backend_quant_constraints stops an A2A backend, which
+        # Marlin lacks.
         pass
     elif (
         uses_expert_remap

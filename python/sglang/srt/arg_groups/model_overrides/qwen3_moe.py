@@ -5,12 +5,12 @@ from typing import Any, Dict
 
 from sglang.srt.arg_groups.model_override_base import (
     _register_for,
+    model_config_of,
     resolving_view,
 )
 from sglang.srt.configs.quant_utils import (
     LOADER_RESOLVED_QUANT_METHODS,
     get_quantization_config,
-    is_w4a16_nvfp4_checkpoint,
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
@@ -91,7 +91,10 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
             and cfg.moe_a2a_backend == "none"
             and cfg.moe_runner_backend == "auto"
             # W4A16 experts keep auto, which ModelOptNvFp4FusedMoEMethod runs on Marlin.
-            and not is_w4a16_nvfp4_checkpoint(hf_config)
+            and not (
+                quantization in (None, "modelopt_fp4")
+                and model_config_of(server_args).is_w4a16_nvfp4_checkpoint()
+            )
         ):
             overrides["moe_runner_backend"] = "flashinfer_trtllm"
             logger.info(

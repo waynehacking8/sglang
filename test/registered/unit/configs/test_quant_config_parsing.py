@@ -1,4 +1,8 @@
+import json
+import os
+import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -71,6 +75,40 @@ class TestQuantLogString(CustomTestCase):
         result = model_config.get_quantization_config_log_str()
         print(f"\n[Test No Quant] Result: {result}")
         self.assertIsNone(result)
+
+
+class TestW4A16Nvfp4Checkpoint(CustomTestCase):
+    """ModelOpt exports declare the quantization in config.json or only in
+    hf_quant_config.json; the check reads both, as the loader does."""
+
+    def _model_config(self, model_path, quantization_config=None):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.model_path = model_path
+        model_config.hf_config = SimpleNamespace(architectures=["Qwen3MoeForCausalLM"])
+        if quantization_config is not None:
+            model_config.hf_config.quantization_config = quantization_config
+        return model_config
+
+    def test_reads_config_json_and_hf_quant_config_json(self):
+        for quant_algo, expected in (
+            ("W4A16_NVFP4", True),
+            ("NVFP4", False),
+            ("MIXED_PRECISION", False),
+        ):
+            with tempfile.TemporaryDirectory() as model_path:
+                with self.subTest(source="config.json", quant_algo=quant_algo):
+                    model_config = self._model_config(
+                        model_path,
+                        {"quant_method": "modelopt", "quant_algo": quant_algo},
+                    )
+                    self.assertIs(model_config.is_w4a16_nvfp4_checkpoint(), expected)
+                with open(os.path.join(model_path, "hf_quant_config.json"), "w") as f:
+                    json.dump({"quantization": {"quant_algo": quant_algo}}, f)
+                with self.subTest(source="hf_quant_config.json", quant_algo=quant_algo):
+                    model_config = self._model_config(model_path)
+                    self.assertIs(model_config.is_w4a16_nvfp4_checkpoint(), expected)
+        with tempfile.TemporaryDirectory() as model_path:
+            self.assertFalse(self._model_config(model_path).is_w4a16_nvfp4_checkpoint())
 
 
 if __name__ == "__main__":

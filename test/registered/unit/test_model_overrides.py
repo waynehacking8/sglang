@@ -32,7 +32,7 @@ from sglang.srt.arg_groups.overrides import (
     validate_declarations,
 )
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.environ import envs
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import (
@@ -1824,6 +1824,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             quantization="modelopt",
             hf_config=outer_config,
             hf_text_config=SimpleNamespace(mlp_hidden_act="relu2"),
+            is_w4a16_nvfp4_checkpoint=lambda: False,
         )
         server_args = SimpleNamespace(
             quantization=None,
@@ -2892,7 +2893,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             return hf
 
         def _args(mc_quant, hf, **kw):
-            mc = SimpleNamespace(quantization=mc_quant, hf_config=hf)
+            quant_algo = (getattr(hf, "quantization_config", None) or {}).get(
+                "quant_algo"
+            )
+            mc = SimpleNamespace(
+                quantization=mc_quant,
+                hf_config=hf,
+                is_w4a16_nvfp4_checkpoint=lambda: quant_algo == "W4A16_NVFP4",
+            )
             defaults = dict(
                 quantization=None,
                 moe_runner_backend="auto",
@@ -3017,16 +3025,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         "moe_runner_backend": "flashinfer_cutlass",
                     },
                 )
-        with (
-            override_platform(is_sm100=True),
-            override_platform(is_blackwell=True),
-        ):
-            self.assertEqual(
-                _nemotron_h_overrides(
-                    _args("modelopt_fp4", hf_w4a16, **attn), hf_w4a16
-                ),
-                {"quantization": "modelopt_fp4"},
-            )
+        # With an A2A backend, which Marlin lacks, W4A16 keeps auto as well, and
+        # _moe_runner_backend_quant_constraints stops it instead of quantizing
+        # the activations to FP4 on flashinfer_cutlass.
+        for a2a in ("none", "flashinfer_nvlink_one_sided"):
+            with (
+                self.subTest(a2a=a2a),
+                override_platform(is_sm100=True),
+                override_platform(is_blackwell=True),
+            ):
+                self.assertEqual(
+                    _nemotron_h_overrides(
+                        _args("modelopt_fp4", hf_w4a16, moe_a2a_backend=a2a, **attn),
+                        hf_w4a16,
+                    ),
+                    {"quantization": "modelopt_fp4"},
+                )
 
     def test_speculative_moe_runner_default_pass(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
@@ -3920,34 +3934,63 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     {"moe_runner_backend": "triton"},
                 )
         # On SM110/SM120, modelopt_fp4 gets flashinfer_cutlass, except that a
-        # top-level W4A16_NVFP4 checkpoint without an A2A backend keeps auto,
-        # which the NVFP4 MoE method runs on Marlin.
+        # top-level W4A16_NVFP4 checkpoint keeps auto, which the NVFP4 MoE
+        # method runs on Marlin. On any CUDA GPU, such a checkpoint stops here
+        # with an A2A backend other than MegaMoE, which sets its own runner. The
+        # checkpoint may declare it in config.json or only in hf_quant_config.json.
         cutlass = {"moe_runner_backend": "flashinfer_cutlass"}
-        for platform in ("is_sm110", "is_sm120"):
+        model_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, model_dir)
+        for platform, source, quant_algo, a2a, expected in (
+            (platform, source, quant_algo, a2a, expected)
+            for platform in ("is_sm100", "is_sm110", "is_sm120")
+            for source in ("config.json", "hf_quant_config.json")
             for quant_algo, a2a, expected in (
-                ("NVFP4", "none", cutlass),
-                ("NVFP4", "flashinfer_nvlink_one_sided", cutlass),
+                ("NVFP4", "none", {} if platform == "is_sm100" else cutlass),
+                (
+                    "NVFP4",
+                    "flashinfer_nvlink_one_sided",
+                    {} if platform == "is_sm100" else cutlass,
+                ),
                 ("W4A16_NVFP4", "none", {}),
-                ("W4A16_NVFP4", "flashinfer_nvlink_one_sided", cutlass),
+                ("W4A16_NVFP4", "flashinfer_nvlink_one_sided", None),
+                ("W4A16_NVFP4", "deepep", None),
+                ("W4A16_NVFP4", "flashinfer_megamoe", {}),
+            )
+        ):
+            model_config = ModelConfig.__new__(ModelConfig)
+            model_config.model_path = model_dir
+            model_config.hf_config = SimpleNamespace(
+                architectures=["Qwen3MoeForCausalLM"]
+            )
+            hf_quant_config = os.path.join(model_dir, "hf_quant_config.json")
+            if source == "config.json":
+                model_config.hf_config.quantization_config = {
+                    "quant_method": "modelopt",
+                    "quant_algo": quant_algo,
+                }
+                if os.path.exists(hf_quant_config):
+                    os.remove(hf_quant_config)
+            else:
+                with open(hf_quant_config, "w") as f:
+                    json.dump({"quantization": {"quant_algo": quant_algo}}, f)
+            with (
+                self.subTest(
+                    platform=platform, source=source, quant_algo=quant_algo, a2a=a2a
+                ),
+                override_platform(is_cuda=True, **{platform: True}),
+                patch(
+                    "sglang.srt.arg_groups.overrides.model_config_of",
+                    return_value=model_config,
+                ),
             ):
-                model_config = SimpleNamespace(
-                    hf_config=SimpleNamespace(
-                        quantization_config={"quant_algo": quant_algo}
-                    )
-                )
-                with (
-                    self.subTest(platform=platform, quant_algo=quant_algo, a2a=a2a),
-                    override_platform(**{platform: True}),
-                    patch(
-                        "sglang.srt.arg_groups.overrides.model_config_of",
-                        return_value=model_config,
-                    ),
-                ):
+                view = _view(quantization="modelopt_fp4", moe_a2a_backend=a2a)
+                if expected is None:
+                    with self.assertRaisesRegex(ValueError, "--moe-a2a-backend none"):
+                        _moe_runner_backend_quant_constraints(view)
+                else:
                     self.assertEqual(
-                        _moe_runner_backend_quant_constraints(
-                            _view(quantization="modelopt_fp4", moe_a2a_backend=a2a)
-                        ),
-                        expected,
+                        _moe_runner_backend_quant_constraints(view), expected
                     )
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
@@ -4711,6 +4754,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 _quantization_explicitly_unset=False,
                                 moe_a2a_backend="none",
                                 moe_runner_backend="auto",
+                                _model_config=SimpleNamespace(
+                                    is_w4a16_nvfp4_checkpoint=lambda q=quant_algo: (
+                                        q == "W4A16_NVFP4"
+                                    )
+                                ),
                             ),
                             SimpleNamespace(
                                 architectures=["Qwen3MoeForCausalLM"],

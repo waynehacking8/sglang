@@ -16,6 +16,9 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization import modelopt_quant
@@ -33,7 +36,8 @@ def _device(
     """The worker's CUDA device 1 of ``capability`` (device 0 may differ), with
     ``live`` as the process-wide backend and ``tp_ep`` as the tensor and expert
     parallel sizes."""
-    is_blackwell = capability >= (10, 0)
+    # The platform flags describe device 0.
+    is_blackwell = (device_0_capability or capability) >= (10, 0)
     platform = SimpleNamespace(is_blackwell=is_blackwell)
     parallel = SimpleNamespace(tp_size=tp_ep[0], moe_ep_size=tp_ep[1])
     capabilities = {0: device_0_capability or capability, 1: capability}
@@ -42,6 +46,7 @@ def _device(
         mock.patch.object(modelopt_quant, "get_platform", return_value=platform),
         mock.patch.object(modelopt_quant, "get_parallel", return_value=parallel),
         mock.patch.object(modelopt_quant, "is_cuda", return_value=True),
+        mock.patch.object(modelopt_quant, "get_cuda_version", return_value=(12, 8)),
         mock.patch.object(modelopt_quant.torch.cuda, "current_device", return_value=1),
         mock.patch.object(
             modelopt_quant,
@@ -114,6 +119,49 @@ class TestNvFp4MoeAutoBackend(CustomTestCase):
                 self.assertIs(runner, live)
                 self.assertEqual(method.enable_flashinfer_trtllm_moe, is_trtllm)
 
+    def test_w4a16_layers_with_an_a2a_backend_refuse_explicit_fp4_runners(self):
+        """With an A2A backend, an explicit backend that quantizes activations
+        to FP4 would run W4A16 layers as W4A4, so they stop at startup on it,
+        as under auto; the runners that keep their 16-bit activations are kept.
+        Without an A2A backend, an explicit backend is kept as on main."""
+        env = envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16
+        a2a = SimpleNamespace(is_none=lambda: False, is_megamoe=lambda: False)
+        for capability in ((10, 0), (12, 0)):
+            for live, cutedsl_w4a16, kept in (
+                (MoeRunnerBackend.FLASHINFER_CUTLASS, True, False),
+                (MoeRunnerBackend.FLASHINFER_TRTLLM, True, False),
+                (MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED, False, False),
+                (MoeRunnerBackend.FLASHINFER_CUTEDSL, False, False),
+                (MoeRunnerBackend.FLASHINFER_MEGAMOE, False, False),
+                (MoeRunnerBackend.FLASHINFER_CUTEDSL, True, True),
+                (MoeRunnerBackend.FLASHINFER_MEGAMOE, True, True),
+                (MoeRunnerBackend.MARLIN, False, True),
+                (MoeRunnerBackend.LORA_MARLIN, False, True),
+            ):
+                with self.subTest(
+                    capability=capability, live=live.value, env=cutedsl_w4a16
+                ):
+                    with _device(capability, live), env.override(cutedsl_w4a16):
+                        self.assertIs(
+                            _method(is_w4a16=True).get_moe_runner_backend(None),
+                            live,
+                        )
+                        with mock.patch.object(
+                            modelopt_quant, "get_moe_a2a_backend", return_value=a2a
+                        ):
+                            # W4A4 layers keep any explicit backend.
+                            self.assertIs(_method().get_moe_runner_backend(None), live)
+                            if kept:
+                                self.assertIs(
+                                    _method(is_w4a16=True).get_moe_runner_backend(None),
+                                    live,
+                                )
+                            else:
+                                with self.assertRaisesRegex(
+                                    ValueError, "quantizes the activations"
+                                ):
+                                    _method(is_w4a16=True)
+
     def test_auto_outside_sm100_avoids_trtllm_gen(self):
         """trtllm-gen MoE kernels are SM100-only: elsewhere W4A4 layers run on
         FlashInfer CUTLASS and W4A16 layers on Marlin, and the weight prep
@@ -157,9 +205,9 @@ class TestNvFp4MoeAutoBackend(CustomTestCase):
                 self.assertFalse(method.enable_flashinfer_cutlass_moe)
 
     def test_auto_stops_at_startup_where_no_runner_fits(self):
-        """At an expert parallel size flashinfer_cutlass rejects, W4A4 layers
-        have no auto runner (Marlin shares one weight scale between w1 and w3),
-        so the method stops with the sizes instead of picking one silently."""
+        """At an expert parallel size flashinfer_cutlass rejects, auto has no
+        runner for W4A4 layers (Marlin runs them only when asked), so the
+        method stops with the sizes instead of picking one silently."""
         for capability in ((12, 0), (11, 0)):
             with self.subTest(capability=capability):
                 with _device(capability, MoeRunnerBackend.AUTO, tp_ep=(4, 2)):
@@ -170,7 +218,13 @@ class TestNvFp4MoeAutoBackend(CustomTestCase):
                         _method()
 
     def test_auto_reads_the_workers_gpu(self):
-        """With --base-gpu-id, the worker's GPU is not device 0."""
+        """With --base-gpu-id, the worker's GPU is not device 0, for the
+        support check as for the resolution."""
+        with _device((12, 0), MoeRunnerBackend.AUTO, device_0_capability=(9, 0)):
+            method = _method()
+        self.assertIs(
+            method.get_moe_runner_backend(None), MoeRunnerBackend.FLASHINFER_CUTLASS
+        )
         with _device((12, 0), MoeRunnerBackend.AUTO, device_0_capability=(10, 0)):
             method = _method()
         self.assertIs(
@@ -212,13 +266,11 @@ class TestNvFp4MoeAutoBackend(CustomTestCase):
                 self.assertIs(method.get_moe_runner_backend(None), expected)
                 self.assertFalse(method.enable_flashinfer_cutlass_moe)
 
-    def test_w4a16_with_an_a2a_backend_keeps_the_w4a4_runner(self):
-        """Marlin has no A2A path, so with one W4A16 layers resolve as W4A4
-        layers do (TRT-LLM on SM100, CUTLASS on SM120), as on main."""
-        for capability, expected in (
-            ((10, 0), MoeRunnerBackend.FLASHINFER_TRTLLM),
-            ((12, 0), MoeRunnerBackend.FLASHINFER_CUTLASS),
-        ):
+    def test_w4a16_with_an_a2a_backend_stops_at_startup(self):
+        """Only Marlin keeps W4A16 layers' 16-bit activations, and it has no
+        A2A path, so auto refuses the A2A backend instead of quantizing the
+        activations to FP4."""
+        for capability in ((10, 0), (12, 0)):
             with self.subTest(capability=capability):
                 with (
                     _device(capability, MoeRunnerBackend.AUTO),
@@ -229,9 +281,86 @@ class TestNvFp4MoeAutoBackend(CustomTestCase):
                             is_none=lambda: False, is_megamoe=lambda: False
                         ),
                     ),
+                    self.assertRaisesRegex(ValueError, "--moe-a2a-backend none"),
                 ):
-                    method = _method(is_w4a16=True)
-                self.assertIs(method.get_moe_runner_backend(None), expected)
+                    _method(is_w4a16=True)
+
+    def test_auto_leaves_the_swizzled_scales_to_weight_prep(self):
+        """Weight prep binds the swizzled block scales for every runner that
+        reads them, so under auto create_weights allocates none (36 MiB per
+        Qwen3-30B-A3B layer); an explicit flashinfer_cutlass allocates them."""
+        for live, allocated in (
+            (MoeRunnerBackend.AUTO, False),
+            (MoeRunnerBackend.FLASHINFER_CUTLASS, True),
+        ):
+            with self.subTest(live=live.value):
+                with _device((12, 0), live):
+                    method = ModelOptNvFp4FusedMoEMethod(
+                        modelopt_quant.ModelOptFp4Config(
+                            is_checkpoint_nvfp4_serialized=True, group_size=16
+                        )
+                    )
+                    layer = torch.nn.Module()
+                    layer.moe_runner_config = SimpleNamespace(is_gated=True)
+                    layer.num_experts = layer.num_local_experts = 2
+                    method.create_weights(
+                        layer=layer,
+                        num_experts=2,
+                        hidden_size=64,
+                        intermediate_size_per_partition=64,
+                        params_dtype=torch.bfloat16,
+                    )
+                self.assertIs(method.enable_flashinfer_cutlass_moe, True)
+                self.assertIs(layer.w13_blockscale_swizzled is not None, allocated)
+                self.assertIs(layer.w2_blockscale_swizzled is not None, allocated)
+
+    def test_marlin_shares_one_global_scale_for_w1_and_w3(self):
+        """Marlin takes one global weight scale per expert for w1 and w3. Where
+        the checkpoint's differ, the larger one is kept and the other half's
+        block scales absorb the ratio, so each half dequantizes to its
+        checkpoint value up to one E4M3 rounding of its block scales."""
+        torch.manual_seed(0)
+        experts, half, blocks = 4, 32, 8
+        block_scales = (torch.rand(experts, 2 * half, blocks) * 400 + 1).to(
+            torch.float8_e4m3fn
+        )
+        gate = torch.rand(experts) + 0.5
+        for up in (gate.clone(), gate * 3, gate / 3):
+            layer = torch.nn.Module()
+            layer.w13_weight_scale = torch.nn.Parameter(
+                block_scales.clone(), requires_grad=False
+            )
+            layer.w13_weight_scale_2 = torch.nn.Parameter(
+                torch.stack([gate, up], dim=1), requires_grad=False
+            )
+            shared = modelopt_quant._share_w13_global_scale(layer)
+            new = layer.w13_weight_scale.float() * shared[:, None, None]
+            old = block_scales.float() * torch.cat(
+                [
+                    gate[:, None, None].expand(-1, half, 1),
+                    up[:, None, None].expand(-1, half, 1),
+                ],
+                dim=1,
+            )
+            with self.subTest(ratio=(up / gate)[0].item()):
+                self.assertTrue(torch.equal(shared, torch.maximum(gate, up)))
+                # E4M3 keeps 3 mantissa bits: one rounding is within 2^-4.
+                torch.testing.assert_close(new, old, rtol=2**-4, atol=0)
+                if torch.equal(gate, up):
+                    self.assertTrue(
+                        torch.equal(layer.w13_weight_scale.data, block_scales)
+                    )
+        # A checkpoint may store one shared column for w1 and w3.
+        layer.w13_weight_scale_2 = torch.nn.Parameter(
+            gate[:, None].clone(), requires_grad=False
+        )
+        layer.w13_weight_scale = torch.nn.Parameter(
+            block_scales.clone(), requires_grad=False
+        )
+        self.assertTrue(
+            torch.equal(modelopt_quant._share_w13_global_scale(layer), gate)
+        )
+        self.assertTrue(torch.equal(layer.w13_weight_scale.data, block_scales))
 
     def test_cutlass_refuses_gated_shards_it_cannot_pad(self):
         """flashinfer_cutlass pads only non-gated experts, so a per-rank gated
@@ -279,55 +408,6 @@ class TestNvFp4MoeAutoBackend(CustomTestCase):
             method = _method()
             runner = _create_runner(method, apply_router_weight_on_input=True)
         self.assertIs(runner, MoeRunnerBackend.FLASHINFER_CUTLASS)
-
-    def test_cutlass_refuses_router_weights_quantized_before_dispatch(self):
-        """The FP4 all-gather and FlashInfer A2A's NVFP4 dispatch quantize the
-        input before dispatch, but CUTLASS scales a router-on-input layer's BF16
-        input first, so such a layer stops at startup and names the flags that
-        keep the payload in BF16. Without a FlashInfer A2A backend, the NVFP4
-        dispatch switch alone leaves the standard dispatcher's payload in BF16."""
-        with _device((12, 0), MoeRunnerBackend.FLASHINFER_CUTLASS):
-            method = _method()
-        cutlass = MoeRunnerBackend.FLASHINFER_CUTLASS
-        for allgather, flashinfer_a2a, nvfp4_dispatch, refused in (
-            (True, False, False, True),
-            (False, True, True, True),
-            (False, False, True, False),
-        ):
-            a2a = SimpleNamespace(
-                is_flashinfer=lambda f=flashinfer_a2a: f, is_megamoe=lambda: False
-            )
-            with (
-                self.subTest(
-                    allgather=allgather,
-                    flashinfer_a2a=flashinfer_a2a,
-                    nvfp4_dispatch=nvfp4_dispatch,
-                ),
-                mock.patch.object(
-                    modelopt_quant,
-                    "should_use_flashinfer_cutlass_moe_fp4_allgather",
-                    return_value=allgather,
-                ),
-                mock.patch.object(
-                    modelopt_quant, "get_moe_a2a_backend", return_value=a2a
-                ),
-                mock.patch.object(
-                    modelopt_quant, "_use_nvfp4_dispatch", return_value=nvfp4_dispatch
-                ),
-            ):
-                if refused:
-                    with self.assertRaisesRegex(
-                        ValueError,
-                        "--disable-flashinfer-cutlass-moe-fp4-allgather .* or "
-                        "--flashinfer-a2a-dispatch-type bf16",
-                    ):
-                        _create_runner(method, apply_router_weight_on_input=True)
-                else:
-                    self.assertIs(
-                        _create_runner(method, apply_router_weight_on_input=True),
-                        cutlass,
-                    )
-                self.assertIs(_create_runner(method), cutlass)
 
     def test_online_quantization_resolves_like_a_w4a4_checkpoint(self):
         """Experts quantized at load time (a BF16 checkpoint with

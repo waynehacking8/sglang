@@ -143,14 +143,12 @@ class MuseSpark1xFp4Experts(nn.Module):
         if self.use_marlin:
             assert hidden_size % _MARLIN_SHAPE_ALIGNMENT == 0, (
                 f"NVFP4 Marlin MoE needs expert hidden_size divisible by "
-                f"{_MARLIN_SHAPE_ALIGNMENT}, got {hidden_size}. Gated NVFP4 Marlin "
-                "preparation asserts on the unpadded shape instead of padding."
+                f"{_MARLIN_SHAPE_ALIGNMENT}, got {hidden_size}."
             )
             assert intermediate_size % _MARLIN_SHAPE_ALIGNMENT == 0, (
                 f"NVFP4 Marlin MoE needs moe_intermediate_size divisible by "
-                f"{_MARLIN_SHAPE_ALIGNMENT}, got {intermediate_size}. Gated NVFP4 "
-                "Marlin preparation asserts on the unpadded shape instead of "
-                "padding."
+                f"{_MARLIN_SHAPE_ALIGNMENT}, got {intermediate_size}. The Marlin "
+                "forward here passes the unpadded size to the kernel."
             )
 
         # post_expert_norm is unknown until set_post_expert_norm; start with the
