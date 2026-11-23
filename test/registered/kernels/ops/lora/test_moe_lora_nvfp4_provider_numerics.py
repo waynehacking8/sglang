@@ -103,7 +103,7 @@ def _marlin_quant_info(layer):
     return MoeLoraNvFp4MarlinQuantInfo.from_layer(layer)
 
 
-@pytest.mark.parametrize("slices,intermediate", [(2, _I), (1, _I), (1, 64)])
+@pytest.mark.parametrize("slices,intermediate", [(2, _I), (1, _I), (1, 64), (2, 96)])
 def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
     _skip_unless_supported()
     device = torch.device("cuda")
@@ -157,13 +157,16 @@ def test_nvfp4_marlin_gateup_and_down_match_reference(slices, intermediate):
         down = torch.zeros(
             provider.down_out_shape(state), dtype=torch.bfloat16, device=device
         )
+        if state.padded_intermediate is not None:
+            # down() reuses gateup's padded buffer and must clear its tail.
+            state.padded_intermediate.fill_(float("nan"))
         provider.down(state, act, down)
 
         ref_down = torch.einsum("pi,phi->ph", act_pairs.float(), w2_eff[experts])
         got_down = down[pair_idx].float()
         assert rel_l2(got_down, ref_down) < 2e-2
 
-        if intermediate == _I:
+        if intermediate == _I or slices == 2:
             return
 
         from sglang.srt.lora.workspace import LoraWorkspace

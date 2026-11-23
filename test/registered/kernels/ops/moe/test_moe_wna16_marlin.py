@@ -1232,7 +1232,7 @@ def test_moe_wna16_marlin_inactive_output_ownership(has_inactive_prefix_count):
 @pytest.mark.parametrize("use_expert_map", [False, True])
 @pytest.mark.parametrize("weight_first", [False, True])
 @pytest.mark.parametrize("fused_norm", [False, True])
-@pytest.mark.parametrize("hidden,intermediate", [(256, 256), (512, 128)])
+@pytest.mark.parametrize("hidden,intermediate", [(256, 256), (512, 128), (256, 96)])
 def test_muse_marlin_inactive_routes(
     fused_norm, hidden, intermediate, weight_first, use_expert_map
 ):

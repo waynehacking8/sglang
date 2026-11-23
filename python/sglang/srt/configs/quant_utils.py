@@ -8,6 +8,14 @@ import os
 LOADER_RESOLVED_QUANT_METHODS = frozenset({"awq", "gptq"})
 
 
+def modelopt_mixed_config_is_incomplete(quant_cfg: dict) -> bool:
+    """Whether a modelopt_mixed config.json lacks the per-layer map or the
+    KV-cache metadata, so the loader reads hf_quant_config.json instead."""
+    return "quantized_layers" not in quant_cfg or (
+        "kv_cache_quant_algo" not in quant_cfg and "kv_cache_scheme" not in quant_cfg
+    )
+
+
 def has_hf_quant_config(model_path: str) -> bool:
     """Check if the model path contains hf_quant_config.json file.
 

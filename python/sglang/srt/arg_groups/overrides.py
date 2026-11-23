@@ -1825,10 +1825,25 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
                 moe_runner_backend,
             )
             moe_runner_backend = mxfp8_default
+    raw_input = getattr(record_of(view), "_raw_input", None) or {}
+    if (
+        moe_runner_backend not in ("auto", "marlin", "lora_marlin")
+        and raw_input.get("moe_runner_backend", "auto") == "auto"
+        and get_platform().is_cuda
+        and model_config_of(view).has_w4a16_nvfp4_moe_layers
+    ):
+        # A default chose a runner that quantizes activations to FP4. Under auto,
+        # ModelOptNvFp4FusedMoEMethod runs W4A16 layers on Marlin instead.
+        logger.info(
+            "Keep auto as MoE runner backend instead of %s for W4A16_NVFP4 MoE layers",
+            moe_runner_backend,
+        )
+        moe_runner_backend = "auto"
     if (
         moe_runner_backend == "auto"
         and view.quantization == "modelopt_fp4"
         and (get_platform().is_sm120 or get_platform().is_sm110)
+        and not model_config_of(view).has_w4a16_nvfp4_moe_layers
     ):
         moe_runner_backend = "flashinfer_cutlass"
         logger.info(

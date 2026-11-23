@@ -3104,13 +3104,16 @@ class DeepseekV2Model(nn.Module):
                     [
                         "w13_weight",
                         "w2_weight",
-                        # only for nvfp4
+                        # only for nvfp4 runners that allocate them before loading
                         *(
                             [
                                 "w13_blockscale_swizzled",
                                 "w2_blockscale_swizzled",
                             ]
-                            if hasattr(module, "w13_blockscale_swizzled")
+                            if isinstance(
+                                getattr(module, "w13_blockscale_swizzled", None),
+                                torch.nn.Parameter,
+                            )
                             else []
                         ),
                     ]

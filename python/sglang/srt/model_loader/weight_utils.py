@@ -58,6 +58,7 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     is_qwen3_5_mtp_draft,
 )
+from sglang.srt.configs.quant_utils import modelopt_mixed_config_is_incomplete
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -449,13 +450,7 @@ def get_quant_config(
         # quantization metadata is missing.
         modelopt_mixed_config_incomplete = (
             model_config.quantization == "modelopt_mixed"
-            and (
-                "quantized_layers" not in hf_quant_config
-                or (
-                    "kv_cache_quant_algo" not in hf_quant_config
-                    and "kv_cache_scheme" not in hf_quant_config
-                )
-            )
+            and modelopt_mixed_config_is_incomplete(hf_quant_config)
         )
         if not modelopt_mixed_config_incomplete:
             hf_quant_config["packed_modules_mapping"] = packed_modules_mapping

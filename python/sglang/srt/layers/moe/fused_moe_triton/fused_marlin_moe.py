@@ -17,6 +17,7 @@ if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
     from sglang.kernels.ops.activation.activation import (
+        gelu_and_mul,
         silu_and_mul,
         silu_and_mul_with_activation_rounding,
     )
@@ -176,6 +177,7 @@ def fused_marlin_moe(
     is_gated: bool = True,
     no_combine: bool = False,
     no_combine_keep_router_weight: bool = True,
+    apply_router_weight_on_input: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -204,6 +206,9 @@ def fused_marlin_moe(
         ``[num_tokens, topk, hidden]``, instead of their top-k sum.
     - no_combine_keep_router_weight (bool): With no_combine, False returns the
         rows without router weights.
+    - apply_router_weight_on_input (bool): Weight each expert's input by its
+        router weight (Llama 4) instead of its output; no_combine rows then
+        carry the weight, as in the Triton MoE.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
@@ -211,6 +216,9 @@ def fused_marlin_moe(
     from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size
 
     assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
+    assert not (apply_router_weight_on_input and w1_bias is not None), (
+        "A router weight on the input would also scale the w1 bias"
+    )
     assert hidden_states.shape[1] == w1.shape[1] * 16, "Hidden size mismatch w1"
     assert hidden_states.shape[1] == w2.shape[2] // (num_bits // 2), (
         "Hidden size mismatch w2"
@@ -219,6 +227,9 @@ def fused_marlin_moe(
     assert w1.is_contiguous(), "Expert weights1 must be contiguous"
     assert w2.is_contiguous(), "Expert weights2 must be contiguous"
     assert hidden_states.dtype in [torch.float16, torch.bfloat16]
+    # The kernel reads float32 router weights; Llama 4's router returns the
+    # activation dtype.
+    topk_weights = topk_weights.to(torch.float32)
     is_mxfp4_marlin = (
         num_bits == 4
         and w1_zeros is None
@@ -346,7 +357,8 @@ def fused_marlin_moe(
         topk_weights,
         moe_block_size=block_size_m,
         top_k=topk,
-        mul_topk_weights=False,
+        # Scaling the first GEMM's output rows equals scaling its input.
+        mul_topk_weights=apply_router_weight_on_input,
         is_ep=expert_map is not None,
         expert_ids_are_sorted=expert_map is None,
         has_inactive_prefix_count=expert_map is None,
@@ -378,6 +390,8 @@ def fused_marlin_moe(
         )
     elif activation == "silu" and is_gated:
         silu_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
+    elif activation == "gelu" and is_gated:
+        gelu_and_mul(intermediate_cache1.view(-1, gemm1_n), intermediate_cache2)
     elif activation == "situ" and is_gated:
         situ_and_mul(
             intermediate_cache2,
@@ -410,7 +424,8 @@ def fused_marlin_moe(
         topk_weights,
         moe_block_size=block_size_m,
         top_k=1,
-        mul_topk_weights=not no_combine or no_combine_keep_router_weight,
+        mul_topk_weights=not apply_router_weight_on_input
+        and (not no_combine or no_combine_keep_router_weight),
         zero_inactive_output=True,
         is_ep=expert_map is not None,
         expert_ids_are_sorted=expert_map is None,

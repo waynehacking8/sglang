@@ -37,6 +37,7 @@ from sglang.srt.configs.ernie55 import (
     to_nextn_draft_config,
 )
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
+from sglang.srt.configs.quant_utils import modelopt_mixed_config_is_incomplete
 from sglang.srt.configs.unlimited_ocr_v2 import (
     FALLBACK_CONTEXT_LENGTH,
     UocrDocumentConfig,
@@ -1977,82 +1978,112 @@ class ModelConfig:
             # compressed-tensors uses a "compression_config" key
             quant_cfg = getattr(self.hf_config, "compression_config", None)
         if quant_cfg is None:
-            # check if is modelopt or mixed-precision model -- Both of them don't have corresponding field
-            # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
-            # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
-            # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
-            is_local = os.path.exists(self.model_path)
-            if not is_local:
-                # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
+            quant_cfg = self._parse_hf_quant_config_json()
+        return quant_cfg
+
+    def _parse_hf_quant_config_json(self):
+        """hf_quant_config.json in the checkpoint, parsed, or None."""
+        quant_cfg = None
+        # check if is modelopt or mixed-precision model -- Both of them don't have corresponding field
+        # in hf `config.json` but has a standalone `hf_quant_config.json` in the root directory
+        # example: https://huggingface.co/nvidia/Llama-3.1-8B-Instruct-FP8/tree/main
+        # example: https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/tree/main
+        is_local = os.path.exists(self.model_path)
+        if not is_local:
+            # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
+            if envs.SGLANG_USE_MODELSCOPE.get():
+                from modelscope import HubApi, model_file_download
+
+                hf_api = HubApi()
+            else:
+                import huggingface_hub
+                from huggingface_hub import HfApi, hf_hub_download
+
+                hf_api = HfApi()
+            try:
+                # In offline mode, skip file_exists check to avoid OfflineModeIsEnabled error
+                # Instead, directly try to download/read from cache with local_files_only
+                file_exists = False  # Initialize to avoid UnboundLocalError
+                if not huggingface_hub.constants.HF_HUB_OFFLINE:
+                    # Online mode: check if file exists before attempting download (optimization)
+                    file_exists = retry(
+                        lambda: hf_api.file_exists(
+                            self.model_path,
+                            "hf_quant_config.json",
+                            revision=self.revision,
+                        ),
+                        max_retry=2,
+                        initial_delay=1.0,
+                        max_delay=5.0,
+                    )
+                    if not file_exists:
+                        # File doesn't exist on hub, no need to try downloading
+                        return quant_cfg  # None
+
+                # Download (online mode) or read from cache (offline mode)
                 if envs.SGLANG_USE_MODELSCOPE.get():
-                    from modelscope import HubApi, model_file_download
-
-                    hf_api = HubApi()
+                    quant_config_file = model_file_download(
+                        model_id=self.model_path,
+                        file_path="hf_quant_config.json",
+                        revision=self.revision,
+                    )
                 else:
-                    import huggingface_hub
-                    from huggingface_hub import HfApi, hf_hub_download
-
-                    hf_api = HfApi()
-                try:
-                    # In offline mode, skip file_exists check to avoid OfflineModeIsEnabled error
-                    # Instead, directly try to download/read from cache with local_files_only
-                    file_exists = False  # Initialize to avoid UnboundLocalError
-                    if not huggingface_hub.constants.HF_HUB_OFFLINE:
-                        # Online mode: check if file exists before attempting download (optimization)
-                        file_exists = retry(
-                            lambda: hf_api.file_exists(
-                                self.model_path, "hf_quant_config.json"
-                            ),
-                            max_retry=2,
-                            initial_delay=1.0,
-                            max_delay=5.0,
-                        )
-                        if not file_exists:
-                            # File doesn't exist on hub, no need to try downloading
-                            return quant_cfg  # None
-
-                    # Download (online mode) or read from cache (offline mode)
-                    if envs.SGLANG_USE_MODELSCOPE.get():
-                        quant_config_file = model_file_download(
-                            model_id=self.model_path,
-                            file_path="hf_quant_config.json",
-                            revision=self.revision,
-                        )
-                    else:
-                        quant_config_file = hf_hub_download(
-                            repo_id=self.model_path,
-                            filename="hf_quant_config.json",
-                            revision=self.revision,
-                            local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
-                        )
-                    with open(quant_config_file) as f:
-                        quant_config_dict = json.load(f)
-                    quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
-                except huggingface_hub.errors.LocalEntryNotFoundError:
-                    # Offline mode and file not in cache - this is normal for non-quantized models
-                    logger.debug(
-                        f"hf_quant_config.json not found in cache for {self.model_path} "
-                        "(offline mode, normal for non-quantized models)"
+                    quant_config_file = hf_hub_download(
+                        repo_id=self.model_path,
+                        filename="hf_quant_config.json",
+                        revision=self.revision,
+                        local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
                     )
-                except huggingface_hub.errors.OfflineModeIsEnabled:
-                    # Should not reach here after our changes, but keep for safety
-                    logger.warning(
-                        "Offline mode is enabled, skipping hf_quant_config.json check"
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "Failed to load hf_quant_config.json for model %s: %s",
-                        self.model_path,
-                        e,
-                    )
-            elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
-                quant_config_file = os.path.join(
-                    self.model_path, "hf_quant_config.json"
-                )
                 with open(quant_config_file) as f:
                     quant_config_dict = json.load(f)
                 quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
+            except huggingface_hub.errors.LocalEntryNotFoundError:
+                # Offline mode and file not in cache - this is normal for non-quantized models
+                logger.debug(
+                    f"hf_quant_config.json not found in cache for {self.model_path} "
+                    "(offline mode, normal for non-quantized models)"
+                )
+            except huggingface_hub.errors.OfflineModeIsEnabled:
+                # Should not reach here after our changes, but keep for safety
+                logger.warning(
+                    "Offline mode is enabled, skipping hf_quant_config.json check"
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to load hf_quant_config.json for model %s: %s",
+                    self.model_path,
+                    e,
+                )
+        elif os.path.exists(os.path.join(self.model_path, "hf_quant_config.json")):
+            quant_config_file = os.path.join(self.model_path, "hf_quant_config.json")
+            with open(quant_config_file) as f:
+                quant_config_dict = json.load(f)
+            quant_cfg = self._parse_modelopt_quant_config(quant_config_dict)
         return quant_cfg
+
+    @cached_property
+    def has_w4a16_nvfp4_moe_layers(self) -> bool:
+        """Whether ModelOpt declares W4A16_NVFP4 for the whole checkpoint or for
+        MIXED_PRECISION expert layers, in config.json or hf_quant_config.json."""
+        if self.quantization not in ("modelopt_fp4", "modelopt_mixed"):
+            return False
+        quant_cfg = self._parse_quant_hf_config() or {}
+        if (
+            self.quantization == "modelopt_mixed"
+            and modelopt_mixed_config_is_incomplete(quant_cfg)
+        ):
+            # The loader reads hf_quant_config.json then (get_quant_config),
+            # its quant_algo as well as its layer map.
+            quant_cfg = self._parse_hf_quant_config_json() or quant_cfg
+        if str(quant_cfg.get("quant_algo", "")).upper() == "W4A16_NVFP4":
+            return True
+        layers = quant_cfg.get("quantized_layers")
+        return any(
+            ".experts" in name
+            and str(info.get("quant_algo", "")).upper() == "W4A16_NVFP4"
+            for name, info in (layers or {}).items()
+            if isinstance(info, dict)
+        )
 
     def _find_quant_modelslim_config(self):
         if self.is_draft_model:
@@ -2096,7 +2127,11 @@ class ModelConfig:
                 if isinstance(layer_info, dict)
             )
             if has_modelopt_nvfp4_layers:
-                return {"quant_method": "modelopt_mixed", "quant_algo": quant_algo}
+                return {
+                    "quant_method": "modelopt_mixed",
+                    "quant_algo": quant_algo,
+                    "quantized_layers": quantized_layers,
+                }
             return {"quant_method": "w4afp8", "quant_algo": quant_algo}
         elif quant_algo and ("FP4" in quant_algo or "NVFP4" in quant_algo):
             return {"quant_method": "modelopt_fp4", "quant_algo": quant_algo}

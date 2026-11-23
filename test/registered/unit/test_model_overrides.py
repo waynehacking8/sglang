@@ -32,7 +32,7 @@ from sglang.srt.arg_groups.overrides import (
     validate_declarations,
 )
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
-from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.model_config import AttentionArch, ModelConfig
 from sglang.srt.environ import envs
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import (
@@ -3835,6 +3835,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
 
+        # The stub records name no model; on a CUDA host the W4A16 rule reads
+        # the checkpoint, so give them one without ModelOpt layers.
+        no_modelopt = patch(
+            "sglang.srt.arg_groups.overrides.model_config_of",
+            return_value=SimpleNamespace(
+                quantization=None, has_w4a16_nvfp4_moe_layers=False
+            ),
+        )
+        no_modelopt.start()
+        self.addCleanup(no_modelopt.stop)
+
         with override_platform(is_sm100=True):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
@@ -3868,13 +3879,117 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     _moe_runner_backend_quant_constraints(_view(**aiter_view)),
                     {"moe_runner_backend": "triton"},
                 )
-        with override_platform(is_sm120=True):
-            self.assertEqual(
-                _moe_runner_backend_quant_constraints(
-                    _view(quantization="modelopt_fp4")
+        # On SM110/SM120, --quantization modelopt_fp4 gets flashinfer_cutlass,
+        # except for W4A16
+        # NVFP4 MoE layers, which keep auto so the NVFP4 MoE method runs them on
+        # Marlin. A default that chose a runner quantizing their activations to
+        # FP4 goes back to auto; a runner the caller passed stays. The checkpoint
+        # may declare W4A16 for all layers or for MIXED_PRECISION experts, in
+        # config.json or only in hf_quant_config.json.
+        cutlass = {"moe_runner_backend": "flashinfer_cutlass"}
+        auto = {"moe_runner_backend": "auto"}
+        mixed_w4a16 = {
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.layers.0.mlp.experts.0.gate_proj": {"quant_algo": "W4A16_NVFP4"}
+            },
+        }
+        model_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, model_dir)
+        for platform, source, (name, quant, quantization), runner, raw, expected in (
+            (platform, source, checkpoint, runner, raw, expected)
+            for platform in ("is_sm100", "is_sm110", "is_sm120")
+            for source in ("config.json", "hf_quant_config.json")
+            for checkpoint, runner, raw, expected in (
+                (
+                    ("NVFP4", {"quant_algo": "NVFP4"}, "modelopt_fp4"),
+                    "auto",
+                    "auto",
+                    {} if platform == "is_sm100" else cutlass,
                 ),
-                {"moe_runner_backend": "flashinfer_cutlass"},
+                (
+                    ("NVFP4", {"quant_algo": "NVFP4"}, "modelopt_fp4"),
+                    "flashinfer_trtllm",
+                    "auto",
+                    {},
+                ),
+                (
+                    ("W4A16", {"quant_algo": "W4A16_NVFP4"}, "modelopt_fp4"),
+                    "auto",
+                    "auto",
+                    {},
+                ),
+                (
+                    ("W4A16", {"quant_algo": "W4A16_NVFP4"}, "modelopt_fp4"),
+                    "flashinfer_trtllm",
+                    "auto",
+                    auto,
+                ),
+                (
+                    ("W4A16", {"quant_algo": "W4A16_NVFP4"}, "modelopt_fp4"),
+                    "flashinfer_cutlass",
+                    "flashinfer_cutlass",
+                    {},
+                ),
+                (
+                    ("W4A16", {"quant_algo": "W4A16_NVFP4"}, "modelopt_fp4"),
+                    "marlin",
+                    "auto",
+                    {},
+                ),
+                (("mixed", mixed_w4a16, "modelopt_mixed"), "auto", "auto", {}),
+                (
+                    ("mixed", mixed_w4a16, "modelopt_mixed"),
+                    "flashinfer_trtllm",
+                    "auto",
+                    auto,
+                ),
             )
+        ):
+            model_config = ModelConfig.__new__(ModelConfig)
+            model_config.model_path = model_dir
+            # What _verify_quantization resolves, with or without --quantization.
+            model_config.quantization = quantization
+            model_config.hf_config = SimpleNamespace(
+                architectures=["Qwen3MoeForCausalLM"]
+            )
+            hf_quant_config = os.path.join(model_dir, "hf_quant_config.json")
+            if source == "config.json":
+                model_config.hf_config.quantization_config = {
+                    "quant_method": "modelopt",
+                    **quant,
+                }
+                if os.path.exists(hf_quant_config):
+                    os.remove(hf_quant_config)
+            else:
+                with open(hf_quant_config, "w") as f:
+                    json.dump({"quantization": quant}, f)
+            for cli in (quantization, None, "modelopt"):
+                # Only --quantization modelopt_fp4 pins flashinfer_cutlass. A
+                # launch without it, or with the generic modelopt, keeps auto and
+                # the NVFP4 MoE method picks each layer's runner on its own GPU.
+                want = {} if expected == cutlass and cli != quantization else expected
+                with (
+                    self.subTest(
+                        platform=platform,
+                        source=source,
+                        checkpoint=name,
+                        runner=runner,
+                        raw=raw,
+                        cli=cli,
+                    ),
+                    override_platform(is_cuda=True, **{platform: True}),
+                    patch(
+                        "sglang.srt.arg_groups.overrides.model_config_of",
+                        return_value=model_config,
+                    ),
+                ):
+                    view = _view(
+                        quantization=cli,
+                        moe_runner_backend=runner,
+                        _raw_input={"moe_runner_backend": raw},
+                    )
+                    self.assertEqual(_moe_runner_backend_quant_constraints(view), want)
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
     def test_gguf_quantization_pass(self):

@@ -6,10 +6,12 @@ reference. Single GPU, tp=ep=1.
 """
 
 import unittest
+from unittest import mock
 
 import torch
 
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.quantization import modelopt_quant
 from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.srt.utils import get_device_sm, round_up
@@ -40,6 +42,13 @@ class TestNvFp4MoeBackends(CustomTestCase):
         backend: str,
         intermediate_size: int = I,
         swiglu_limit: float | None = None,
+        *,
+        top_k: int = TOPK,
+        is_w4a16: bool = False,
+        w3_magnitude: float = 1.0,
+        apply_router_weight_on_input: bool = False,
+        check_magnitude: bool = False,
+        activation: str = "silu",
     ):
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
         from sglang.srt.layers.moe.topk import TopKConfig, select_experts
@@ -48,6 +57,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
         quant_config = ModelOptFp4Config(
             is_checkpoint_nvfp4_serialized=True, group_size=16
         )
+        quant_config.is_w4a16 = is_w4a16
         with (
             get_context().override_server_args(model_path="dummy"),
             get_flags().moe.override(runner_backend=MoeRunnerBackend(backend)),
@@ -65,11 +75,13 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 hidden_size=H,
                 intermediate_size=intermediate_size,
                 layer_id=0,
-                top_k=TOPK,
+                top_k=top_k,
                 params_dtype=torch.bfloat16,
                 quant_config=quant_config,
                 swiglu_limit=swiglu_limit,
                 gate_up_interleaved=False,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                activation=activation,
             ).cuda()
 
             # Checkpoint-format shards through the real weight_loader;
@@ -93,18 +105,24 @@ class TestNvFp4MoeBackends(CustomTestCase):
                         if shard_id in ("w1", "w3")
                         else (H, intermediate_size)
                     )
-                    w = (
-                        torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda")
-                        / 10
+                    # A w3 of another magnitude gets its own global scale.
+                    magnitude = w3_magnitude if shard_id == "w3" else 1.0
+                    w = torch.randn(rows, cols, dtype=torch.bfloat16, device="cuda") * (
+                        magnitude / 10
                     )
                     w_q, sf_linear, gs, w_dequant = quantize_nvfp4_shard(w)
                     prefix = "w13" if shard_id in ("w1", "w3") else "w2"
-                    for suffix, loaded in (
+                    shards = [
                         ("weight", w_q),
                         ("weight_scale", sf_linear),
                         ("weight_scale_2", (1.0 / gs).clone()),
-                        ("input_scale", torch.tensor(act_scale, device="cuda")),
-                    ):
+                    ]
+                    if not is_w4a16:
+                        # W4A16 checkpoints carry no activation scales.
+                        shards.append(
+                            ("input_scale", torch.tensor(act_scale, device="cuda"))
+                        )
+                    for suffix, loaded in shards:
                         name = f"{prefix}_{suffix}"
                         param = getattr(layer, name)
                         layer.weight_loader(
@@ -148,8 +166,17 @@ class TestNvFp4MoeBackends(CustomTestCase):
             topk_output = select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
-                topk_config=TopKConfig(top_k=TOPK, renormalize=True),
+                # Renormalized top-1 weights are all 1, which would hide where
+                # a router-on-input layer applies them.
+                topk_config=TopKConfig(
+                    top_k=top_k, renormalize=not apply_router_weight_on_input
+                ),
             )
+            if apply_router_weight_on_input:
+                # Llama 4's router returns its weights in the activation dtype.
+                topk_output = topk_output._replace(
+                    topk_weights=topk_output.topk_weights.to(torch.bfloat16)
+                )
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
             out = layer.forward(x, topk_output)
@@ -158,6 +185,7 @@ class TestNvFp4MoeBackends(CustomTestCase):
             if not isinstance(out, torch.Tensor):
                 out = out[0] if isinstance(out, tuple) else out.hidden_states
 
+            backend_used = layer.quant_method.get_moe_runner_backend(layer)
             ref = self._torch_moe_reference(
                 x,
                 topk_weights,
@@ -166,16 +194,38 @@ class TestNvFp4MoeBackends(CustomTestCase):
                 refs["w3"],
                 refs["w2"],
                 swiglu_limit,
+                # Marlin keeps 16-bit activations.
+                fp4_activations=not backend_used.is_marlin(),
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                activation=activation,
             )
             assert_output_close(self, out, ref)
+            if check_magnitude:
+                # The cosine check cannot see a scale error, such as a w3
+                # dequantized with w1's global scale or a router weight applied
+                # twice or not at all.
+                norm_ratio = (out.float().norm() / ref.norm()).item()
+                self.assertLess(abs(norm_ratio - 1), 0.1)
+            return layer
 
     @staticmethod
     def _torch_moe_reference(
-        x, topk_weights, topk_ids, w1_ref, w3_ref, w2_ref, swiglu_limit
+        x,
+        topk_weights,
+        topk_ids,
+        w1_ref,
+        w3_ref,
+        w2_ref,
+        swiglu_limit,
+        fp4_activations=True,
+        apply_router_weight_on_input=False,
+        activation="silu",
     ):
         from flashinfer import fp4_quantize
 
         def quant_roundtrip(t2d, gs):
+            if not fp4_activations:
+                return t2d.to(torch.bfloat16).float()
             q, sf = fp4_quantize(t2d.to(torch.bfloat16), gs)
             return dequantize_nvfp4_to_dtype(q, sf, gs, torch.float32)
 
@@ -185,24 +235,118 @@ class TestNvFp4MoeBackends(CustomTestCase):
         act_gs = torch.tensor(
             FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX, dtype=torch.float32, device="cuda"
         )
-        x_dq = quant_roundtrip(x.float(), act_gs)
         m, h = x.shape
         ref = torch.zeros(m, h, dtype=torch.float32, device="cuda")
         for t in range(m):
             for j in range(topk_ids.shape[1]):
                 e = int(topk_ids[t, j])
-                gate = x_dq[t] @ w1_ref[e].T
-                up = x_dq[t] @ w3_ref[e].T
+                weight = float(topk_weights[t, j])
+                x_t = x[t : t + 1].float()
+                if apply_router_weight_on_input:
+                    # The runner scales the BF16 input before quantizing it.
+                    x_t = (x_t * weight).to(torch.bfloat16).float()
+                    weight = 1.0
+                x_dq = quant_roundtrip(x_t, act_gs)[0]
+                gate = x_dq @ w1_ref[e].T
+                up = x_dq @ w3_ref[e].T
                 if swiglu_limit is not None:
                     gate = gate.clamp(max=swiglu_limit)
                     up = up.clamp(-swiglu_limit, swiglu_limit)
-                act = torch.nn.functional.silu(gate) * up
+                if activation == "gelu":
+                    act = torch.nn.functional.gelu(gate) * up
+                else:
+                    act = torch.nn.functional.silu(gate) * up
                 act_dq = quant_roundtrip(act.unsqueeze(0), act_gs)[0]
-                ref[t] += float(topk_weights[t, j]) * (act_dq @ w2_ref[e].T)
+                ref[t] += weight * (act_dq @ w2_ref[e].T)
         return ref
 
     def test_flashinfer_cutlass(self):
         self._run_backend("flashinfer_cutlass")
+
+    def test_flashinfer_cutlass_scales_and_padding(self):
+        """CUTLASS takes one GEMM1 scale for w1 and w3: where the two global
+        scales differ, the block scales absorb the ratio, as for Marlin. A
+        96-wide gated shard (Qwen3-30B-A3B at TP8) is padded to 128 per half
+        at allocation, as for TRT-LLM."""
+        for intermediate_size, w3_magnitude in ((I, 3.0), (96, 1.0), (96, 3.0)):
+            with self.subTest(
+                intermediate_size=intermediate_size, w3_magnitude=w3_magnitude
+            ):
+                self._run_backend(
+                    "flashinfer_cutlass",
+                    intermediate_size,
+                    w3_magnitude=w3_magnitude,
+                    check_magnitude=True,
+                )
+
+    def test_auto(self):
+        """auto must prepare the weights for the runner it resolves to (TRT-LLM
+        on SM100, FlashInfer CUTLASS on SM110/SM120); a layer prepared for one
+        runner and dispatched to another fails in its first forward."""
+        self._run_backend("auto")
+
+    def test_flashinfer_cutlass_router_weight_on_input(self):
+        """A layer that applies its top-1 router weight to the input (Llama 4)
+        dispatches BF16, since flashinfer_cutlass scales that input before
+        quantizing it, while the launch's other layers still dispatch FP4."""
+        with mock.patch.object(
+            modelopt_quant, "_use_nvfp4_dispatch", return_value=True
+        ):
+            layer = self._run_backend(
+                "flashinfer_cutlass",
+                top_k=1,
+                apply_router_weight_on_input=True,
+                check_magnitude=True,
+            )
+            self.assertIsNone(layer.dispatcher.quant_config["input_global_scale"])
+            layer = self._run_backend("flashinfer_cutlass")
+            self.assertIsNotNone(layer.dispatcher.quant_config["input_global_scale"])
+
+    def test_marlin(self):
+        """Marlin takes one global weight scale for w1 and w3: where the two
+        differ, the block scales absorb the ratio. Gated widths no Marlin tile
+        fits (96, Qwen3-30B-A3B's 768 at TP8) are padded per half."""
+        for intermediate_size, w3_magnitude in ((I, 3.0), (96, 1.0), (96, 3.0)):
+            with self.subTest(
+                intermediate_size=intermediate_size, w3_magnitude=w3_magnitude
+            ):
+                self._run_backend(
+                    "marlin",
+                    intermediate_size,
+                    w3_magnitude=w3_magnitude,
+                    check_magnitude=True,
+                )
+
+    def test_marlin_router_weight_on_input(self):
+        """Marlin applies a router-on-input layer's weight (Llama 4) in its
+        first GEMM, which equals weighting the input."""
+        for is_w4a16 in (False, True):
+            with self.subTest(w4a16=is_w4a16):
+                self._run_backend(
+                    "marlin",
+                    top_k=1,
+                    apply_router_weight_on_input=True,
+                    is_w4a16=is_w4a16,
+                    check_magnitude=True,
+                )
+
+    def test_auto_w4a16(self):
+        """W4A16 layers resolve to Marlin under auto and keep 16-bit activations,
+        with SiLU or Gemma 4's gated GELU."""
+        for activation in ("silu", "gelu"):
+            with self.subTest(activation=activation):
+                layer = self._run_backend(
+                    "auto",
+                    96,
+                    is_w4a16=True,
+                    w3_magnitude=3.0,
+                    check_magnitude=True,
+                    activation=activation,
+                )
+                self.assertIs(
+                    layer.quant_method.get_moe_runner_backend(layer),
+                    MoeRunnerBackend.MARLIN,
+                )
 
     def test_flashinfer_trtllm(self):
         self._run_backend("flashinfer_trtllm")

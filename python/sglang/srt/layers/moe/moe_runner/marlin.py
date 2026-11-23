@@ -143,7 +143,8 @@ def fused_experts_none_to_marlin(
         assert runner_config.activation in {
             "silu",
             "situ",
-        }, f"Only gated SiLU/SiTU is supported, got {runner_config.activation}."
+            "gelu",
+        }, f"Only gated SiLU/SiTU/GELU is supported, got {runner_config.activation}."
     elif runner_config.activation not in {"silu", "relu2"}:
         raise ValueError(
             f"Unsupported Marlin MoE activation: {runner_config.activation}"
@@ -206,6 +207,7 @@ def fused_experts_none_to_marlin(
         is_gated=runner_config.is_gated,
         no_combine=runner_config.no_combine,
         no_combine_keep_router_weight=runner_config.no_combine_keep_router_weight,
+        apply_router_weight_on_input=runner_config.apply_router_weight_on_input,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(
