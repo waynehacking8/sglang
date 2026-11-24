@@ -588,5 +588,7 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_boundary_decay_start_chunks",
     "shortest_prefill_budget_min_ratio",
     "shortest_prefill_budget_doubling_chunks",
+    "_moe_runner_backend_explicitly_set",
+    "_speculative_moe_runner_backend_explicitly_set",
 )
 # fmt: on
