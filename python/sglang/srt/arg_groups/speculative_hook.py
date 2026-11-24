@@ -144,6 +144,21 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     # _speculative_moe_runner_default), invoked here at its legacy slot.
 
     run_post_process_pass(server_args, _speculative_moe_runner_default)
+    if cfg._speculative_moe_runner_backend_explicitly_set is None:
+        # The record says whether the user passed the draft backend; unset, the
+        # draft inherits explicitness only when it kept the target's backend
+        # (not a lora_* target's auto or a model's draft default).
+        if server_args.speculative_moe_runner_backend is not None:
+            explicit = server_args.speculative_moe_runner_backend != "auto"
+        else:
+            explicit = bool(cfg._moe_runner_backend_explicitly_set) and (
+                cfg.speculative_moe_runner_backend == cfg.moe_runner_backend
+            )
+        declare_resolution(
+            server_args,
+            "handle_speculative_decoding",
+            _speculative_moe_runner_backend_explicitly_set=explicit,
+        )
 
     if cfg.speculative_algorithm is not None:
         declare_resolution(
